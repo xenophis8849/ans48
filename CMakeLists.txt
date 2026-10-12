@@ -33,7 +33,16 @@ if(ANS48_BUILD_CHECK OR NOT ANDROID)
   target_link_libraries(ans48_robust PRIVATE ans48)
   if(NOT ANDROID)
     target_link_libraries(ans48_robust PRIVATE pthread)
-    add_executable(ans48_oom test/ans48_oom.cpp)   # 内存分配失败注入（只在 Linux 主机）
-    target_link_libraries(ans48_oom PRIVATE ans48)
+    # 内存分配失败注入：借 glibc 的 __libc_malloc 转发，只在能链接到它的 Linux 主机上编（macOS、musl 跳过）
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      include(CheckCSourceCompiles)
+      check_c_source_compiles("#include <stddef.h>
+extern void* __libc_malloc(size_t);
+int main(void) { return __libc_malloc(1) == 0; }" ANS48_HAVE_LIBC_MALLOC)
+      if(ANS48_HAVE_LIBC_MALLOC)
+        add_executable(ans48_oom test/ans48_oom.cpp)
+        target_link_libraries(ans48_oom PRIVATE ans48)
+      endif()
+    endif()
   endif()
 endif()
