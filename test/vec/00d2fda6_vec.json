@@ -1,0 +1,62 @@
+{
+ "00d2fda6_monitor_48k_g1.pcm": {
+  "mode": "monitor",
+  "fs": 48000,
+  "gamma": 1.0,
+  "n_fft": 256,
+  "hop": 128,
+  "samples": 479872,
+  "rms_in": 0.07548175007104874,
+  "rms_out": 0.06993371248245239
+ },
+ "00d2fda6_monitor_48k_g2.pcm": {
+  "mode": "monitor",
+  "fs": 48000,
+  "gamma": 2.0,
+  "n_fft": 256,
+  "hop": 128,
+  "samples": 479872,
+  "rms_in": 0.07548175007104874,
+  "rms_out": 0.06480187177658081
+ },
+ "00d2fda6_monitor_441_g1.pcm": {
+  "mode": "monitor",
+  "fs": 44100,
+  "gamma": 1.0,
+  "n_fft": 256,
+  "hop": 128,
+  "samples": 440832,
+  "rms_in": 0.07548605650663376,
+  "rms_out": 0.06995578110218048
+ },
+ "00d2fda6_monitor_441_g2.pcm": {
+  "mode": "monitor",
+  "fs": 44100,
+  "gamma": 2.0,
+  "n_fft": 256,
+  "hop": 128,
+  "samples": 440832,
+  "rms_in": 0.07548605650663376,
+  "rms_out": 0.06483721733093262
+ },
+ "00d2fda6_stream_48k_g1.pcm": {
+  "mode": "stream",
+  "fs": 48000,
+  "gamma": 1.0,
+  "n_fft": 1024,
+  "hop": 512,
+  "samples": 479232,
+  "rms_in": 0.07548175007104874,
+  "rms_out": 0.06990839540958405
+ },
+ "00d2fda6_stream_441_g1.pcm": {
+  "mode": "stream",
+  "fs": 44100,
+  "gamma": 1.0,
+  "n_fft": 1024,
+  "hop": 512,
+  "samples": 440320,
+  "rms_in": 0.07548605650663376,
+  "rms_out": 0.06982121616601944
+ }
+}
