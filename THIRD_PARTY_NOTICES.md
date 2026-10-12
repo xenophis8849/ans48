@@ -4,6 +4,8 @@
 
 `third_party/pffft/`，静态链接进 `libans48.so`。来源：<https://github.com/marton78/pffft>。
 
+本库对 pffft 的修改：`src/pffft_priv_impl.h` 的 setup 创建函数检查两处内存分配，失败时返回 NULL（原实现直接解引用空指针）。
+
 **分发包含 `libans48.so` 的软件（例如 App）时，须在随附文档或其他材料中附上以下版权声明、条款与免责声明**（pffft 许可对二进制分发的要求）。
 
 ```

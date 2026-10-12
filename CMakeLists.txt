@@ -33,5 +33,7 @@ if(ANS48_BUILD_CHECK OR NOT ANDROID)
   target_link_libraries(ans48_robust PRIVATE ans48)
   if(NOT ANDROID)
     target_link_libraries(ans48_robust PRIVATE pthread)
+    add_executable(ans48_oom test/ans48_oom.cpp)   # 内存分配失败注入（只在 Linux 主机）
+    target_link_libraries(ans48_oom PRIVATE ans48)
   endif()
 endif()

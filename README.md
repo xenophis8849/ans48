@@ -22,7 +22,7 @@
 | `src/` | 实现：`ans48.cpp`（接口）、`ulunas_kernel.*`（网络的手写流式推理）、`denoise_stage.h`（分帧 / FFT / 掩码 / 重叠相加）、`models.cpp`（内嵌权重，自动生成） |
 | `models/` | 权重原件（`kernel_weights.bin` + `kernel_manifest.json`），`tools/embed_models.py` 把它们编进 `src/models.cpp` |
 | `prebuilt/arm64-v8a/libans48.so`、`prebuilt/armeabi-v7a/libans48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
-| `test/ans48_check.cpp`、`test/ans48_robust.cpp`、`test/ans48_wrap.cpp`、`test/ans48_bench.cpp`、`test/vec/` | 自检、接口健壮性测试、计数器回绕测试、端上测速、测试向量 |
+| `test/ans48_check.cpp`、`test/ans48_robust.cpp`、`test/ans48_wrap.cpp`、`test/ans48_oom.cpp`、`test/ans48_bench.cpp`、`test/vec/` | 自检、接口健壮性测试、计数器回绕测试、内存分配失败注入（Linux 主机）、端上测速、测试向量 |
 | `tools/build_android.sh` | 编两个 ABI 的库与手机上跑的测试程序 |
 
 ---
@@ -111,6 +111,7 @@ cd test/vec
 ```sh
 ./build-host/ans48_robust test/vec/00d2fda6_in48k.pcm test/vec/00d2fda6_in441.pcm
 ./build-host/ans48_wrap test/vec/00d2fda6_in48k.pcm     # 输出缓冲计数器跨过 2^32 / 2^64 回绕点时输出不中断
+./build-host/ans48_oom                                   # 建实例时每一次内存分配逐次失败：都返回 NULL、不崩溃
 ```
 
 网络推理另有逐层核对（权重导出时同时录下参照网络每一块在两帧输入下的输出，手写实现逐块比较；主机与手机、arm64 与 armv7 均通过，最大差 1e-5 量级）。该核对依赖训练端代码，不在本仓库。
@@ -161,7 +162,8 @@ adb shell 'cd /data/local/tmp/ans48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`ans48 0.2 (monitor ulunas-w256 e50, stream ulunas-w1024 e73)`。
+- 当前：`ans48 0.2.1 (monitor ulunas-w256 e50, stream ulunas-w1024 e73)`。
+- 0.2.1 修改：0.2 新接入的 pffft 在建 FFT 时没有检查内存分配失败，内存不足时 `ans48_create` 会使宿主进程崩溃（应返回 NULL）。已补上检查（对 pffft 的修改见 THIRD_PARTY_NOTICES）。新增 `test/ans48_oom`（Linux 主机）：让建实例过程中的每一次内存分配逐次失败，确认都返回 NULL、不崩溃。处理结果与 0.2 相同。
 - 0.2 修改（模型不变；对参照实现的自检仍为 −100 ~ −104 dB、最大差 1 LSB）：落端提速，核心占用约降一半到三分之二，见性能表。
   - tanh / sigmoid 改用有理函数逼近（最大误差 3.3e-7，可向量化、无溢出），原先每帧几千次 libm 调用是最大的单项开销；
   - 逐点卷积改为 4 输出通道 × 4 频点的寄存器分块；深度卷积与步长 2 的普通 / 转置卷积改为先补零、按抽头整行乘加（去掉边界判断与分支）；
