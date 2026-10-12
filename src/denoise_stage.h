@@ -2,6 +2,7 @@
 // 固有延迟 = 窗长：开头预置一个 hop 的滞后，加上一帧要凑满窗（窗 256 在 48 kHz 下 5.3 ms，窗 1024 为 21.3 ms）。
 #pragma once
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #include "ulunas_kernel.h"
@@ -56,7 +57,7 @@ struct StreamDenoise {
     Fft fft;
     std::vector<float> win, inbuf, num, den, re, im, mag, mask, fifo;
     int fill = 0;          // 当前 hop 已攒了几个样本
-    size_t fifoR = 0, fifoW = 0;
+    uint64_t fifoR = 0, fifoW = 0;   // 按样本累计的读 / 写位置。64 位：32 位平台上 size_t 约 24.9 h（48 kHz）就回绕，旧的 fifoR < fifoW 判断会从此恒假、持续输出 0
 
     void prepare(ulk::Net* n_) {
         net = n_;
@@ -113,7 +114,7 @@ struct StreamDenoise {
         const size_t mask_ = fifo.size() - 1;
         for (int i = 0; i < hop; ++i) {
             float d = den[i] < 1e-11f ? 1e-11f : den[i];
-            fifo[(fifoW + i) & mask_] = num[i] / d;
+            fifo[(size_t)((fifoW + i) & mask_)] = num[i] / d;
         }
         fifoW += hop;
     }
@@ -128,7 +129,7 @@ struct StreamDenoise {
                 memmove(inbuf.data(), inbuf.data() + hop, sizeof(float) * (nFft - hop));
                 fill = 0;
             }
-            y[i] = (fifoR < fifoW) ? fifo[fifoR++ & m] : 0.0f;
+            y[i] = (fifoR != fifoW) ? fifo[(size_t)(fifoR++ & m)] : 0.0f;   // 写位置不会落后读位置，不相等即有数据（即使回绕也成立）
         }
     }
 };

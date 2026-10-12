@@ -53,7 +53,7 @@ static void run(Ans48* a, const float* in, float* out, int n) {
 }
 
 extern "C" {
-const char* ans48_version(void) { static const std::string v = std::string("ans48 0.1 (") + ans48_model_id + ")"; return v.c_str(); }
+const char* ans48_version(void) { static const std::string v = std::string("ans48 0.1.1 (") + ans48_model_id + ")"; return v.c_str(); }
 
 Ans48* ans48_create(int sample_rate, int mode) {
     if ((sample_rate != 48000 && sample_rate != 44100) || (mode != ANS48_MODE_MONITOR && mode != ANS48_MODE_STREAM)) return nullptr;

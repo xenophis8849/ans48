@@ -21,7 +21,7 @@
 | `src/` | 实现：`ans48.cpp`（接口）、`ulunas_kernel.*`（网络的手写流式推理）、`denoise_stage.h`（分帧 / FFT / 掩码 / 重叠相加）、`models.cpp`（内嵌权重，自动生成） |
 | `models/` | 权重原件（`kernel_weights.bin` + `kernel_manifest.json`），`tools/embed_models.py` 把它们编进 `src/models.cpp` |
 | `prebuilt/arm64-v8a/libans48.so`、`prebuilt/armeabi-v7a/libans48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
-| `test/ans48_check.cpp`、`test/ans48_robust.cpp`、`test/ans48_bench.cpp`、`test/vec/` | 自检、接口健壮性测试、端上测速、测试向量 |
+| `test/ans48_check.cpp`、`test/ans48_robust.cpp`、`test/ans48_wrap.cpp`、`test/ans48_bench.cpp`、`test/vec/` | 自检、接口健壮性测试、计数器回绕测试、端上测速、测试向量 |
 | `tools/build_android.sh` | 编两个 ABI 的库与手机上跑的测试程序 |
 
 ---
@@ -109,6 +109,7 @@ cd test/vec
 
 ```sh
 ./build-host/ans48_robust test/vec/00d2fda6_in48k.pcm test/vec/00d2fda6_in441.pcm
+./build-host/ans48_wrap test/vec/00d2fda6_in48k.pcm     # 输出缓冲计数器跨过 2^32 / 2^64 回绕点时输出不中断
 ```
 
 网络推理另有逐层核对（权重导出时同时录下参照网络每一块在两帧输入下的输出，手写实现逐块比较；主机与手机、arm64 与 armv7 均通过，最大差 1e-5 量级）。该核对依赖训练端代码，不在本仓库。
@@ -156,7 +157,8 @@ adb shell 'cd /data/local/tmp/ans48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`ans48 0.1 (monitor ulunas-w256 e50, stream ulunas-w1024 e73)`。
+- 当前：`ans48 0.1.1 (monitor ulunas-w256 e50, stream ulunas-w1024 e73)`。
+- 0.1.1 修改：输出缓冲的读写计数器改为 64 位、可读判断改为"读写位置不相等"。0.1 在 32 位（armeabi-v7a）上计数器约 24.9 小时（48 kHz）回绕，之后持续输出 0 而接口照常返回成功。新增 `test/ans48_wrap`：把计数器设到 2^32 / 2^64 回绕点前处理，输出与从 0 开始逐样本相同。
 - 网络为 UL-UNAS 结构的降噪掩码模型（约 15.4 万 / 20.3 万参数，耳返 / 推流），以 44.1 kHz 训练；48 kHz 下按 48 kHz 的频率刻度重建 ERB 投影。耳返档两个采样率的权重相同（高频段 64 个频点对 64 个 ERB 频带，投影与采样率无关）。
 - 推理为手写流式实现（逐帧、显式状态、BatchNorm 折进卷积、每帧零分配），不依赖推理框架。
 
