@@ -6,6 +6,7 @@
 //
 // 正确性靠逐块核对：权重导出时同时录下参照网络每一块在两帧输入下的输出，与本实现逐块比较。
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -72,7 +73,8 @@ struct CTFA {
     FA fa;
     void prepare(const Weights& w, const std::string& pfx, int channels, int nFreq);
     void reset();
-    void run(float* x /*就地，(C,nF)*/);
+    // out 非空：结果不写回 x，而是写到 out 的第 outRow[c] 行，并加上 res（残差，可空）——把输出洗牌和残差并进最后一遍
+    void run(float* x /*就地，(C,nF)*/, float* out = nullptr, const int* outRow = nullptr, const float* res = nullptr);
 };
 
 /** 逐通道逐频点仿射 + PReLU。 */
@@ -80,11 +82,20 @@ struct AffinePReLU {
     int C = 0, nF = 0;
     const float *aw = nullptr, *ab = nullptr, *slope = nullptr;
     void prepare(const Weights& w, const std::string& pfx, int channels, int nFreq);
-    void run(float* x);
+    void run(float* x) const;
+    // 只处理第 c 个通道的一行（卷积写完一行就地做，省一遍整块读写）
+    inline void row(float* __restrict r, int c) const {
+        const float* __restrict aws = aw + (size_t)c * nF; const float* __restrict abs_ = ab + (size_t)c * nF; const float sl = slope[c];
+        for (int f = 0; f < nF; ++f) { const float v = r[f]; r[f] = aws[f] * v + abs_[f] + (std::max(v, 0.0f) + sl * std::min(v, 0.0f)); }   // 无分支（= v > 0 ? v : sl·v）
+    }
 };
 
 /** 二维卷积，时间维 kt（吃历史缓冲）、频率维 kf（补零 kf/2）、频率步长 sf。 */
 struct Conv {
+    std::vector<float> zb;   // 无偏置时的零偏置（逐点快速路径用）
+    std::vector<float> padr; // 深度卷积 / 步长 2 快速路径的补零行
+    std::vector<float> accr; // 步长 2 转置卷积的累加行
+    std::vector<int> inMap;  // 非空：第 c 个输入通道取输入的第 inMap[c] 行（把前面的通道洗牌并进读取，只有深度卷积 / 步长 2 快速路径支持）
     int cin = 0, cout = 0, kt = 1, kf = 1, sf = 1, groups = 1;
     int fin = 0, fout = 0;
     bool deconv = false;
@@ -94,7 +105,8 @@ struct Conv {
     void prepare(const Weights& w, const std::string& pfx, int cinN, int coutN,
                  int ktN, int kfN, int sfN, int groupsN, int finN, bool isDeconv);
     void reset();
-    void run(const float* x /*(cin,fin)*/, float* y /*(cout,fout)*/);
+    // post 非空：输出每写完一行就地接激活（省掉激活单独一遍整块读写）
+    void run(const float* x /*(cin,fin)*/, float* y /*(cout,fout)*/, const AffinePReLU* post = nullptr);
 };
 
 /** 通道洗牌：(2C,F) 交错两半。 */
@@ -110,6 +122,7 @@ struct XConvBlock {   // ZeroPad → conv → (bn 已折叠) → AffinePReLU →
     bool useAct = true, useShuffle = false;
     int cout = 0, fout = 0;
     std::vector<float> tmp;
+    std::vector<int> perm;   // 同 XMBBlock::perm
     void reset();
     void run(const float* x, float* y);
 };
@@ -128,6 +141,7 @@ struct XMBBlock {     // pconv1 → act → shuffle? → dconv → act → pconv
     bool shuffleP = false, shuffleOut = false;
     int cin = 0, fin = 0, cmid = 0, fmid = 0, cout = 0, fout = 0;
     std::vector<float> t1, t2, t3, t4;
+    std::vector<int> perm;   // shuffle2 的行映射：输出第 2c 行 ← 第 c 行，第 2c+1 行 ← 第 C+c 行（这里存反向：源行 → 目的行）
     void reset();
     void run(const float* x, float* y);
 };
@@ -144,7 +158,9 @@ struct DPGRNN {
     const float *e2Wih = nullptr, *e2Whh = nullptr, *e2bih = nullptr, *e2bhh = nullptr;
     const float *efcW = nullptr, *efcB = nullptr, *elnW = nullptr, *elnB = nullptr;
     // 全部预分配：处理期不许分配内存。
-    std::vector<float> hInter, xfc, y1, y2, cat, tmp, gates, scratch, in1, in2, o1, o2;
+    std::vector<float> hInter, xfc, cat;
+    // (C,F) 布局版用：输入投影 / 门值 [3H][F]、两个 LayerNorm 的转置权重（原权重按 (F,C) 排）
+    std::vector<float> pj, gx, gh, ilnWT, ilnBT, elnWT, elnBT;
     void prepare(const Weights& w, const std::string& pfx, int channels, int width);
     void reset();
     void run(float* x /*就地 (C,F)*/);
@@ -165,6 +181,7 @@ struct Net {
     Weights w;
     int bins = 129, erbLow = 65, erbHigh = 64;
     const float* erbW = nullptr; const float* ierbW = nullptr;   // ERB 投影 / 反投影矩阵（prepare 时取好）
+    std::vector<int> erbS, erbE, ierbS, ierbE;                   // 两个矩阵每行非零元素的起止（三角滤波器很窄，大部分是 0）
     // 编码器 types=[0,2,1,2,1] → XConv, XMB, XDWS, XMB, XDWS
     XConvBlock en0; XMBBlock en1; XDWSBlock en2; XMBBlock en3; XDWSBlock en4;
     DPGRNN dp0, dp1;

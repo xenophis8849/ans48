@@ -6,55 +6,26 @@
 #include <cstring>
 #include <vector>
 #include "ulunas_kernel.h"
+#include "pffft.h"
+#include <new>
 
 namespace dns {
 
-/** 就地基-2 复数 FFT。只支持 2 的幂；窗 256/128 都是。 */
-struct Fft {
-    int n = 0;
-    std::vector<float> cs, sn;
-    std::vector<int> rev;
-    void prepare(int N) {
-        n = N;
-        cs.resize(n / 2); sn.resize(n / 2);
-        for (int i = 0; i < n / 2; ++i) {
-            cs[i] = cosf(-2.0f * (float)M_PI * i / n);
-            sn[i] = sinf(-2.0f * (float)M_PI * i / n);
-        }
-        rev.assign(n, 0);
-        int j = 0;
-        for (int i = 1; i < n; ++i) {
-            int bit = n >> 1;
-            while (j & bit) { j ^= bit; bit >>= 1; }
-            j |= bit;
-            rev[i] = j;
-        }
-    }
-    void run(float* re, float* im) const {
-        for (int i = 1; i < n; ++i) { int j = rev[i]; if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); } }
-        for (int len = 2; len <= n; len <<= 1) {
-            const int step = n / len, h = len >> 1;
-            for (int i = 0; i < n; i += len) {
-                int k = 0;
-                for (int p = i; p < i + h; ++p) {
-                    const int q = p + h;
-                    const float wr = cs[k], wi = sn[k];
-                    const float xr = re[q] * wr - im[q] * wi;
-                    const float xi = re[q] * wi + im[q] * wr;
-                    re[q] = re[p] - xr; im[q] = im[p] - xi;
-                    re[p] += xr;        im[p] += xi;
-                    k += step;
-                }
-            }
-        }
-    }
+/** 实数 FFT（pffft，有序打包：out[0] = DC，out[1] = 奈奎斯特，之后 (实, 虚) 成对）。缓冲在 init 时对齐分配，处理期不分配。 */
+struct RFft { int N = 0; PFFFT_Setup* s = nullptr; float *in = nullptr, *out = nullptr, *wk = nullptr;
+    RFft() = default; RFft(const RFft&) = delete; RFft& operator=(const RFft&) = delete;
+    ~RFft() { release(); }
+    void release() { if (s) pffft_destroy_setup(s); pffft_aligned_free(in); pffft_aligned_free(out); pffft_aligned_free(wk); s = nullptr; in = out = wk = nullptr; }
+    void init(int n) { release(); N = n; s = pffft_new_setup(n, PFFFT_REAL);
+        in = (float*)pffft_aligned_malloc(n * 4); out = (float*)pffft_aligned_malloc(n * 4); wk = (float*)pffft_aligned_malloc(n * 4);
+        if (!s || !in || !out || !wk) { release(); throw std::bad_alloc(); } }
 };
 
 struct StreamDenoise {
     ulk::Net* net = nullptr;
     int nFft = 256, hop = 128, bins = 129;
     float gamma = 1.0f;
-    Fft fft;
+    RFft fft;
     std::vector<float> win, inbuf, num, den, re, im, mag, mask, fifo;
     int fill = 0;          // 当前 hop 已攒了几个样本
     uint64_t fifoR = 0, fifoW = 0;   // 按样本累计的读 / 写位置。64 位：32 位平台上 size_t 约 24.9 h（48 kHz）就回绕，旧的 fifoR < fifoW 判断会从此恒假、持续输出 0
@@ -62,7 +33,7 @@ struct StreamDenoise {
     void prepare(ulk::Net* n_) {
         net = n_;
         nFft = net->w.nFft; hop = net->w.hop; bins = net->bins;
-        fft.prepare(nFft);
+        fft.init(nFft);
         win.resize(nFft);
         for (int i = 0; i < nFft; ++i)
             win[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / nFft);
@@ -84,8 +55,11 @@ struct StreamDenoise {
     }
 
     inline void frame() {
-        for (int i = 0; i < nFft; ++i) { re[i] = inbuf[i] * win[i]; im[i] = 0.0f; }
-        fft.run(re.data(), im.data());
+        const int M = nFft / 2;
+        for (int i = 0; i < nFft; ++i) fft.in[i] = inbuf[i] * win[i];
+        pffft_transform_ordered(fft.s, fft.in, fft.out, fft.wk, PFFFT_FORWARD);
+        re[0] = fft.out[0]; im[0] = 0.0f; re[M] = fft.out[1]; im[M] = 0.0f;
+        for (int k = 1; k < M; ++k) { re[k] = fft.out[2 * k]; im[k] = fft.out[2 * k + 1]; }
         for (int k = 0; k < bins; ++k) {
             float m = sqrtf(re[k] * re[k] + im[k] * im[k]);
             mag[k] = log10f(m < 1e-12f ? 1e-12f : m);
@@ -97,10 +71,11 @@ struct StreamDenoise {
             if (gamma != 1.0f) v = powf(v, gamma);
             re[k] *= v; im[k] *= v;
         }
-        // 共轭对称补满上半部，再做逆变换（对共轭做正变换再除以 n）
-        for (int k = bins; k < nFft; ++k) { re[k] = re[nFft - k]; im[k] = -im[nFft - k]; }
-        for (int k = 0; k < nFft; ++k) im[k] = -im[k];
-        fft.run(re.data(), im.data());
+        // 逆实数 FFT（DC 与奈奎斯特频点的虚部按定义为 0，同 torch.fft.irfft）
+        fft.in[0] = re[0]; fft.in[1] = re[M];
+        for (int k = 1; k < M; ++k) { fft.in[2 * k] = re[k]; fft.in[2 * k + 1] = im[k]; }
+        pffft_transform_ordered(fft.s, fft.in, fft.out, fft.wk, PFFFT_BACKWARD);
+        const float* tf = fft.out;
         const float inv = 1.0f / nFft;
         // 重叠相加：分子 w·ifft、分母 w²、相除。与离线逐字同式。
         memmove(num.data(), num.data() + hop, sizeof(float) * (nFft - hop));
@@ -108,7 +83,7 @@ struct StreamDenoise {
         std::fill(num.end() - hop, num.end(), 0.0f);
         std::fill(den.end() - hop, den.end(), 0.0f);
         for (int i = 0; i < nFft; ++i) {
-            num[i] += win[i] * re[i] * inv;
+            num[i] += win[i] * tf[i] * inv;
             den[i] += win[i] * win[i];
         }
         const size_t mask_ = fifo.size() - 1;

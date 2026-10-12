@@ -104,9 +104,37 @@ const Tensor& Weights::at(const std::string& n) const {
 
 // 参数先限到 [−80, 80]，expf 不会溢出成无穷大：-O3 -ffast-math 下 glibc 会换成不处理溢出的向量版 expf，
 // 掩码接近 0 的频点（x < −88）会得到错值。±80 处 sigmoid 离 0 / 1 不到 1e-34。
-static inline float sigmoidf_(float x) { x = x < -80.f ? -80.f : (x > 80.f ? 80.f : x); return 1.0f / (1.0f + expf(-x)); }
+static inline float sigmoidf_(float x) { x = x < -80.f ? -80.f : (x > 80.f ? 80.f : x); return 1.0f / (1.0f + expf(-x)); }   // 精确版（只留作对照）
+// 激活：tanh 用 Eigen 的 13/6 次有理逼近（全实数轴最大绝对误差 3.3e-7），sigmoid = 0.5·tanh(x/2) + 0.5（误差 2.3e-7）。
+// 无 exp、可向量化，且自带限幅不会溢出。整张网络每帧有几千次 tanh / sigmoid（GRU 门控与注意力），逐个调 libm 是主要耗时。
+static inline float ftanh(float x) {
+    x = std::min(7.90531110763549805f, std::max(-7.90531110763549805f, x)); const float x2 = x * x;
+    float p = x2 * -2.76076847742355e-16f + 2.00018790482477e-13f; p = p * x2 + -8.60467152213735e-11f; p = p * x2 + 5.12229709037114e-08f; p = p * x2 + 1.48572235717979e-05f; p = p * x2 + 6.37261928875436e-04f; p = p * x2 + 4.89352455891786e-03f; p = p * x;
+    float q = x2 * 1.19825839466702e-06f + 1.18534705686654e-04f; q = q * x2 + 2.26843463243900e-03f; q = q * x2 + 4.89352518554385e-03f; return p / q; }
+static inline float fsigm(float x) { return 0.5f * ftanh(0.5f * x) + 0.5f; }
+
+typedef float v4f __attribute__((vector_size(16)));
+static inline v4f ld4(const float* p) { v4f v; memcpy(&v, p, 16); return v; }
+static inline void st4(float* p, v4f v) { memcpy(p, &v, 16); }
+// 矩阵 × 向量：一次 4 行，输入向量的每个元素读一次用 4 次（各行仍按 i 依次累加，与逐行写法同序）
+static inline void gemv4(const float* __restrict x, int nIn, const float* __restrict W, const float* __restrict b, int nOut, float* __restrict y) {
+    int o = 0;
+    for (; o + 4 <= nOut; o += 4) {
+        const float *w0 = W + (size_t)o * nIn, *w1 = w0 + nIn, *w2 = w1 + nIn, *w3 = w2 + nIn;
+        float s0 = b ? b[o] : 0.0f, s1 = b ? b[o + 1] : 0.0f, s2 = b ? b[o + 2] : 0.0f, s3 = b ? b[o + 3] : 0.0f;
+        for (int i = 0; i < nIn; ++i) { const float v = x[i]; s0 += w0[i] * v; s1 += w1[i] * v; s2 += w2[i] * v; s3 += w3[i] * v; }
+        y[o] = s0; y[o + 1] = s1; y[o + 2] = s2; y[o + 3] = s3;
+    }
+    for (; o < nOut; ++o) { const float* wr = W + (size_t)o * nIn; float s = b ? b[o] : 0.0f; for (int i = 0; i < nIn; ++i) s += wr[i] * x[i]; y[o] = s; }
+}
+template <int NI, int NO>
+static inline void linearT(const float* __restrict x, const float* __restrict W, const float* __restrict b, float* __restrict y) {
+    for (int o = 0; o < NO; ++o) { const float* wr = W + o * NI; float s = b ? b[o] : 0.0f; for (int i = 0; i < NI; ++i) s += wr[i] * x[i]; y[o] = s; }
+}
 
 void linear(const float* x, int nIn, const float* W, const float* b, int nOut, float* y) {
+    if (nIn == 16 && nOut == 16) { linearT<16, 16>(x, W, b, y); return; }   // DPGRNN 逐频点全连接
+    if (nIn >= 16) { gemv4(x, nIn, W, b, nOut, y); return; }
     for (int o = 0; o < nOut; ++o) {
         const float* wr = W + (size_t)o * nIn;
         float s = b ? b[o] : 0.0f;
@@ -115,31 +143,39 @@ void linear(const float* x, int nIn, const float* W, const float* b, int nOut, f
     }
 }
 
+// 小尺寸 GRU 单步（输入 / 隐层宽度编译期固定）：每帧几百次调用、每次只有几十到几百次乘加，
+// 通用版的循环开销占大头；尺寸写死后编译器能整段展开并向量化。计算式与累加顺序与通用版相同。
+template <int NI, int H>
+static inline void gruStepT(const float* __restrict x, float* __restrict h, const float* __restrict Wih, const float* __restrict Whh,
+                            const float* __restrict bih, const float* __restrict bhh) {
+    float g[3 * H], gh[3 * H];
+    for (int k = 0; k < 3 * H; ++k) { const float* wr = Wih + k * NI; float s = bih[k]; for (int i = 0; i < NI; ++i) s += wr[i] * x[i]; g[k] = s; }
+    for (int k = 0; k < 3 * H; ++k) { const float* wr = Whh + k * H; float s = bhh[k]; for (int i = 0; i < H; ++i) s += wr[i] * h[i]; gh[k] = s; }
+    for (int i = 0; i < H; ++i) {
+        const float r = fsigm(g[i] + gh[i]), z = fsigm(g[H + i] + gh[H + i]), n = ftanh(g[2 * H + i] + r * gh[2 * H + i]);
+        h[i] = (1.0f - z) * n + z * h[i];
+    }
+}
+
 void gruStep(const float* x, int nIn, float* h, int nHid,
              const float* Wih, const float* Whh, const float* bih, const float* bhh,
              float* g) {
+    if (nIn == 8 && nHid == 4) { gruStepT<8, 4>(x, h, Wih, Whh, bih, bhh); return; }   // DPGRNN 频率方向
+    if (nIn == 8 && nHid == 8) { gruStepT<8, 8>(x, h, Wih, Whh, bih, bhh); return; }   // DPGRNN 时间方向
+    if (nIn == 4 && nHid == 4) { gruStepT<4, 4>(x, h, Wih, Whh, bih, bhh); return; }   // 频率注意力
+
     // g 布局：[0,nHid) = W_ir·x + b_ir 等三门的输入部分，随后就地变成门值
     const int H = nHid;
-    for (int k = 0; k < 3 * H; ++k) {
-        const float* wr = Wih + (size_t)k * nIn;
-        float s = bih[k];
-        for (int i = 0; i < nIn; ++i) s += wr[i] * x[i];
-        g[k] = s;
-    }
+    gemv4(x, nIn, Wih, bih, 3 * H, g);
     // 隐状态那三份单独算：n 门要用 r ⊙ (W_hn·h + b_hn)，**b_hn 在括号里面**。
     // 只用到 3*H，而 H 最大是 2*C（C≤32）→ 64。原来开 3*512 = 6 KB 栈，
     // 每次调用都白摸一遍缓存；这个函数一帧要被调几百次。
     float gh[3 * 96];
-    for (int k = 0; k < 3 * H; ++k) {
-        const float* wr = Whh + (size_t)k * H;
-        float s = bhh[k];
-        for (int i = 0; i < H; ++i) s += wr[i] * h[i];
-        gh[k] = s;
-    }
+    gemv4(h, H, Whh, bhh, 3 * H, gh);
     for (int i = 0; i < H; ++i) {
-        float r = sigmoidf_(g[i] + gh[i]);
-        float z = sigmoidf_(g[H + i] + gh[H + i]);
-        float n = tanhf(g[2 * H + i] + r * gh[2 * H + i]);
+        float r = fsigm(g[i] + gh[i]);
+        float z = fsigm(g[H + i] + gh[H + i]);
+        float n = ftanh(g[2 * H + i] + r * gh[2 * H + i]);
         h[i] = (1.0f - z) * n + z * h[i];
     }
 }
@@ -242,7 +278,7 @@ void CTFA::prepare(const Weights& w, const std::string& pfx, int channels, int n
 
 void CTFA::reset() { std::fill(h.begin(), h.end(), 0.0f); }
 
-void CTFA::run(float* x) {
+void CTFA::run(float* x, float* out, const int* outRow, const float* res) {
     for (int c = 0; c < C; ++c) {
         float s = 0.0f;
         const float* row = x + (size_t)c * nF;
@@ -251,13 +287,21 @@ void CTFA::run(float* x) {
     }
     gruStep(zt.data(), C, h.data(), hid, Wih, Whh, bih, bhh, gates.data());
     linear(h.data(), hid, fcW, fcB, C, at.data());
-    for (int c = 0; c < C; ++c) at[c] = sigmoidf_(at[c]);
+    for (int c = 0; c < C; ++c) at[c] = fsigm(at[c]);
     fa.run(x, C, af.data());
-    for (int f = 0; f < nF; ++f) af[f] = sigmoidf_(af[f]);
+    for (int f = 0; f < nF; ++f) af[f] = fsigm(af[f]);
+    if (!out) {
+        for (int c = 0; c < C; ++c) {
+            float a = at[c];
+            float* row = x + (size_t)c * nF;
+            for (int f = 0; f < nF; ++f) row[f] *= a * af[f];
+        }
+        return;
+    }
     for (int c = 0; c < C; ++c) {
-        float a = at[c];
-        float* row = x + (size_t)c * nF;
-        for (int f = 0; f < nF; ++f) row[f] *= a * af[f];
+        const float a = at[c]; const float* __restrict row = x + (size_t)c * nF; float* __restrict o = out + (size_t)outRow[c] * nF;
+        if (res) { const float* __restrict r = res + (size_t)c * nF; for (int f = 0; f < nF; ++f) o[f] = row[f] * (a * af[f]) + r[f]; }
+        else for (int f = 0; f < nF; ++f) o[f] = row[f] * (a * af[f]);
     }
 }
 
@@ -270,17 +314,8 @@ void AffinePReLU::prepare(const Weights& w, const std::string& pfx, int channels
     slope = w.at(pfx + ".slope_weight").p;
 }
 
-void AffinePReLU::run(float* x) {
-    for (int c = 0; c < C; ++c) {
-        float* row = x + (size_t)c * nF;
-        const float* aws = aw + (size_t)c * nF;
-        const float* abs_ = ab + (size_t)c * nF;
-        const float sl = slope[c];
-        for (int f = 0; f < nF; ++f) {
-            float v = row[f];
-            row[f] = aws[f] * v + abs_[f] + (v > 0.0f ? v : sl * v);
-        }
-    }
+void AffinePReLU::run(float* x) const {
+    for (int c = 0; c < C; ++c) row(x + (size_t)c * nF, c);
 }
 
 // ---- Conv / Deconv -----------------------------------------------------
@@ -295,11 +330,44 @@ void Conv::prepare(const Weights& w, const std::string& pfx, int cinN, int coutN
     fout = deconv ? (fin - 1) * sf - 2 * pf + kf
                   : (fin + 2 * pf - kf) / sf + 1;
     hist.assign((size_t)(kt - 1) * cin * fin, 0.0f);
+    zb.assign(cout, 0.0f);
+    padr.assign((size_t)std::max(fin + kf, 2 * fout + kf), 0.0f);
+    accr.assign((size_t)2 * fin + kf, 0.0f);
 }
 
 void Conv::reset() { std::fill(hist.begin(), hist.end(), 0.0f); }
 
-void Conv::run(const float* x, float* y) {
+// 逐点卷积（1×1，步长 1）：一次 4 个输出通道 × 4 个频点，累加值留在寄存器里。原写法每累加一个输入通道
+// 都把整行输出读出再写回（读写多于计算）。每个输出元素仍是"偏置 + 按输入通道依次累加"，与原式同序。
+// act 非空时每写完 4 行就地做激活（第 c0+o 个通道），趁这几行还在缓存里
+static void pw(const float* __restrict w, const float* __restrict b, const float* __restrict x, float* __restrict y, int O, int I, int N,
+               const AffinePReLU* act = nullptr, int c0 = 0) {
+    const int N4 = N & ~3; int o = 0;
+    for (; o + 4 <= O; o += 4) {
+        const float *w0 = w + o * I, *w1 = w0 + I, *w2 = w1 + I, *w3 = w2 + I; float *y0 = y + o * N, *y1 = y0 + N, *y2 = y1 + N, *y3 = y2 + N;
+        for (int n = 0; n < N4; n += 4) {
+            v4f a0 = {b[o], b[o], b[o], b[o]}, a1 = {b[o + 1], b[o + 1], b[o + 1], b[o + 1]}, a2 = {b[o + 2], b[o + 2], b[o + 2], b[o + 2]}, a3 = {b[o + 3], b[o + 3], b[o + 3], b[o + 3]};
+            for (int i = 0; i < I; ++i) { const v4f xv = ld4(x + i * N + n); a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
+            st4(y0 + n, a0); st4(y1 + n, a1); st4(y2 + n, a2); st4(y3 + n, a3);
+        }
+        for (int n = N4; n < N; ++n) { float a0 = b[o], a1 = b[o + 1], a2 = b[o + 2], a3 = b[o + 3];
+            for (int i = 0; i < I; ++i) { const float xv = x[i * N + n]; a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
+            y0[n] = a0; y1[n] = a1; y2[n] = a2; y3[n] = a3; }
+        if (act) { act->row(y0, c0 + o); act->row(y1, c0 + o + 1); act->row(y2, c0 + o + 2); act->row(y3, c0 + o + 3); }
+    }
+    for (; o < O; ++o) { const float* wo = w + o * I; float* yo = y + o * N;
+        for (int n = 0; n < N4; n += 4) { v4f a = {b[o], b[o], b[o], b[o]}; for (int i = 0; i < I; ++i) a += wo[i] * ld4(x + i * N + n); st4(yo + n, a); }
+        for (int n = N4; n < N; ++n) { float a = b[o]; for (int i = 0; i < I; ++i) a += wo[i] * x[i * N + n]; yo[n] = a; }
+        if (act) act->row(yo, c0 + o); }
+}
+
+void Conv::run(const float* x, float* y, const AffinePReLU* post) {
+    if (!deconv && kt == 1 && kf == 1 && sf == 1 && fin == fout) {   // 逐点卷积快速路径（按组）
+        const int cinG = cin / groups, coutG = cout / groups; const float* bb = b ? b : zb.data();
+        for (int g = 0; g < groups; ++g)
+            pw(W + (size_t)g * coutG * cinG, bb + g * coutG, x + (size_t)g * cinG * fin, y + (size_t)g * coutG * fout, coutG, cinG, fout, post, g * coutG);
+        return;
+    }
     const int pf = kf / 2;
     const int cinG = cin / groups, coutG = cout / groups;
     const size_t frameSz = (size_t)cin * fin;
@@ -308,6 +376,79 @@ void Conv::run(const float* x, float* y) {
         // t ∈ [0,kt)：0 是最旧的一帧，kt-1 是当前帧
         return (t == kt - 1) ? x : (hist.data() + (size_t)t * frameSz);
     };
+
+    // 深度卷积（每个输入通道对应一个输出通道、步长 1，普通与转置）：输入行先拷进左右补零的缓冲，
+    // 再对每个抽头整行乘加——没有边界判断，内循环连续可向量化。转置卷积 = 抽头倒序的相关，左补零宽度 kf−1−pf。
+    if (groups == cin && cin == cout && sf == 1 && fin == fout) {
+        const int K = kf, L = deconv ? (K - 1 - pf) : pf;
+        float* __restrict xp = padr.data();
+        for (int c = 0; c < cin; ++c) {
+            float* __restrict yo = y + (size_t)c * fout; const float bv = b ? b[c] : 0.0f;
+            for (int f = 0; f < fout; ++f) yo[f] = bv;
+            for (int t = 0; t < kt; ++t) {
+                const float* xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
+                for (int j = 0; j < L; ++j) xp[j] = 0.0f;
+                memcpy(xp + L, xr, sizeof(float) * fin);
+                for (int j = L + fin; j < fin + K - 1; ++j) xp[j] = 0.0f;
+                const float* wr = W + ((size_t)c * kt + (deconv ? kt - 1 - t : t)) * K;
+                for (int k = 0; k < K; ++k) {
+                    const float w = deconv ? wr[K - 1 - k] : wr[k]; const float* __restrict xs = xp + k;
+                    for (int f = 0; f < fout; ++f) yo[f] += w * xs[f];
+                }
+            }
+            if (post) post->row(yo, c);
+        }
+        if (kt > 1) {
+            for (int t = 0; t + 1 < kt - 1; ++t)
+                memcpy(hist.data() + (size_t)t * frameSz, hist.data() + (size_t)(t + 1) * frameSz, sizeof(float) * frameSz);
+            memcpy(hist.data() + (size_t)(kt - 2) * frameSz, x, sizeof(float) * frameSz);
+        }
+        return;
+    }
+
+    // 步长 2（普通与转置，任意分组）：同样先补零、按抽头整行乘加，没有边界判断。
+    //   普通：y[f] += w[k]·xp[2f + k]，xp 左补 pf 个零；
+    //   转置：输入点 i 落到输出 2i + k − pf，写进左边多留 pf 个位置的累加行 acc[2i + k]，最后取 acc[f + pf]。
+    if (sf == 2) {
+        const int K = kf, cinG = cin / groups, coutG = cout / groups;
+        float* __restrict xp = padr.data();
+        if (!deconv) {
+            for (int o = 0; o < cout; ++o) {
+                float* __restrict yo = y + (size_t)o * fout; const float bv = b ? b[o] : 0.0f; for (int f = 0; f < fout; ++f) yo[f] = bv;
+                const int g = o / coutG;
+                for (int ci = 0; ci < cinG; ++ci) { const int c = g * cinG + ci;
+                    for (int t = 0; t < kt; ++t) {
+                        const float* xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
+                        for (int j = 0; j < pf; ++j) xp[j] = 0.0f;
+                        memcpy(xp + pf, xr, sizeof(float) * fin);
+                        for (int j = pf + fin; j < 2 * fout + K; ++j) xp[j] = 0.0f;
+                        const float* wr = W + ((((size_t)o * cinG + ci) * kt + t) * K);
+                        for (int k = 0; k < K; ++k) { const float w = wr[k]; const float* __restrict xs = xp + k; for (int f = 0; f < fout; ++f) yo[f] += w * xs[2 * f]; }
+                    } }
+                if (post) post->row(yo, o); }
+        } else {
+            float* __restrict acc = accr.data(); const int AL = 2 * fin + K;
+            for (int o = 0; o < cout; ++o) {
+                const int g = o / coutG, j = o % coutG;
+                for (int a = 0; a < AL; ++a) acc[a] = 0.0f;
+                for (int ci = 0; ci < cinG; ++ci) { const int c = g * cinG + ci;
+                    for (int t = 0; t < kt; ++t) {
+                        const float* __restrict xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
+                        const float* wr = W + ((((size_t)c * coutG + j) * kt + (kt - 1 - t)) * K);
+                        for (int k = 0; k < K; ++k) { const float w = wr[k]; float* __restrict as = acc + k; for (int i = 0; i < fin; ++i) as[2 * i] += w * xr[i]; }
+                    } }
+                float* yo = y + (size_t)o * fout; const float bv = b ? b[o] : 0.0f;
+                for (int f = 0; f < fout; ++f) yo[f] = bv + acc[f + pf];
+                if (post) post->row(yo, o);
+            }
+        }
+        if (kt > 1) {
+            for (int t = 0; t + 1 < kt - 1; ++t)
+                memcpy(hist.data() + (size_t)t * frameSz, hist.data() + (size_t)(t + 1) * frameSz, sizeof(float) * frameSz);
+            memcpy(hist.data() + (size_t)(kt - 2) * frameSz, x, sizeof(float) * frameSz);
+        }
+        return;
+    }
 
     for (int o = 0; o < cout; ++o) {
         float* yo = y + (size_t)o * fout;
@@ -433,6 +574,7 @@ void Conv::run(const float* x, float* y) {
                            hist.data() + (size_t)(t + 1) * frameSz, sizeof(float) * frameSz);
                 memcpy(hist.data() + (size_t)(kt - 2) * frameSz, x, sizeof(float) * frameSz);
             }
+            if (post) post->run(y);
             return;
         }
         for (int c = 0; c < cin; ++c) {
@@ -464,6 +606,7 @@ void Conv::run(const float* x, float* y) {
                    hist.data() + (size_t)(t + 1) * frameSz, sizeof(float) * frameSz);
         memcpy(hist.data() + (size_t)(kt - 2) * frameSz, x, sizeof(float) * frameSz);
     }
+    if (post) post->run(y);
 }
 
 }  // namespace ulk
@@ -475,46 +618,41 @@ namespace ulk {
 void XConvBlock::reset() { conv.reset(); ctfa.reset(); }
 
 void XConvBlock::run(const float* x, float* y) {
-    conv.run(x, useShuffle ? tmp.data() : y);
-    float* z = useShuffle ? tmp.data() : y;
-    if (useAct) act.run(z);
-    ctfa.run(z);
-    if (useShuffle) shuffle2(tmp.data(), cout, fout, y);
+    conv.run(x, useShuffle ? tmp.data() : y, useAct ? &act : nullptr);
+    if (useShuffle) ctfa.run(tmp.data(), y, perm.data());   // 输出洗牌并进 cTFA 的最后一遍
+    else ctfa.run(y);
 }
 
 void XDWSBlock::reset() { pconv.reset(); dconv.reset(); ctfa.reset(); }
 
 void XDWSBlock::run(const float* x, float* y) {
-    pconv.run(x, t1.data());
-    act1.run(t1.data());
+    pconv.run(x, t1.data(), &act1);
     // 不要 std::swap(t1,t2)：两个缓冲尺寸不一定相同，交换之后后面按名字取到的是错的那块（会越界）。
     const float* dz = t1.data();
-    if (shuffleP) { shuffle2(t1.data(), cmid, fmid, t2.data()); dz = t2.data(); }
-    dconv.run(dz, y);
-    if (useAct2) act2.run(y);
+    if (shuffleP && dconv.inMap.empty()) { shuffle2(t1.data(), cmid, fmid, t2.data()); dz = t2.data(); }   // 一般情况下洗牌已并进 dconv 的读取
+    dconv.run(dz, y, useAct2 ? &act2 : nullptr);
     ctfa.run(y);
 }
 
 void XMBBlock::reset() { pconv1.reset(); dconv.reset(); pconv2.reset(); ctfa.reset(); }
 
 void XMBBlock::run(const float* x, float* y) {
-    pconv1.run(x, t1.data());
-    act1.run(t1.data());
+    pconv1.run(x, t1.data(), &act1);
     const float* dz = t1.data();
-    if (shuffleP) { shuffle2(t1.data(), cmid, fmid, t2.data()); dz = t2.data(); }
-    dconv.run(dz, t3.data());
-    act2.run(t3.data());
+    if (shuffleP && dconv.inMap.empty()) { shuffle2(t1.data(), cmid, fmid, t2.data()); dz = t2.data(); }
+    dconv.run(dz, t3.data(), &act2);
     // 洗牌的目的地必须是**按 cout×fout 分配**的那块，不能借用中间缓冲——
     // 借用一次就越界（t2 是按 cmid×fmid 分配的）。
     float* dst = shuffleOut ? t4.data() : y;
     pconv2.run(t3.data(), dst);
-    ctfa.run(dst);
     // 残差：形状相同才加，与 torch 版的 `if x.shape == input.shape` 一致
-    if (cin == cout && fin == fout) {
+    const bool res = cin == cout && fin == fout;
+    if (shuffleOut) { ctfa.run(dst, y, perm.data(), res ? x : nullptr); return; }   // cTFA 乘、残差、洗牌一遍做完
+    ctfa.run(dst);
+    if (res) {
         const size_t n = (size_t)cout * fout;
         for (size_t i = 0; i < n; ++i) dst[i] += x[i];
     }
-    if (shuffleOut) shuffle2(t4.data(), cout, fout, y);
 }
 
 // ---- DPGRNN ------------------------------------------------------------
@@ -544,65 +682,71 @@ void DPGRNN::prepare(const Weights& w, const std::string& pfx, int channels, int
     elnW = P(".inter_ln.weight");  elnB = P(".inter_ln.bias");
 
     const int half = C / 2, hh = half / 2;
-    in1.assign((size_t)F * half, 0.0f); in2.assign((size_t)F * half, 0.0f);
-    o1.assign((size_t)F * 2 * hh, 0.0f); o2.assign((size_t)F * 2 * hh, 0.0f);
-    hInter.assign((size_t)F * C, 0.0f);      // 每个频点一份时间方向的状态
+    hInter.assign((size_t)F * C, 0.0f);      // 每个频点一份时间方向的状态，(C,F) 排
     xfc.assign((size_t)F * C, 0.0f);
-    y1.assign((size_t)F * (C / 2), 0.0f);
-    y2.assign((size_t)F * (C / 2), 0.0f);
     cat.assign((size_t)F * C, 0.0f);
-    tmp.assign((size_t)F * C, 0.0f);
-    gates.assign(3 * C + 16, 0.0f);
-    scratch.assign(4 * C + 32, 0.0f);
+    if (hh > 16 || 3 * hh > 48) throw std::runtime_error("ans48: dpgrnn intra hidden too large");
+    pj.assign((size_t)3 * hh * F, 0.0f); gx.assign((size_t)3 * half * F, 0.0f); gh.assign((size_t)3 * half * F, 0.0f);
+    auto tr = [&](const float* src, std::vector<float>& dst) { dst.assign((size_t)F * C, 0.0f); for (int f = 0; f < F; ++f) for (int c = 0; c < C; ++c) dst[(size_t)c * F + f] = src[(size_t)f * C + c]; };
+    tr(ilnW, ilnWT); tr(ilnB, ilnBT); tr(elnW, elnWT); tr(elnB, elnBT);
 }
 
 void DPGRNN::reset() { std::fill(hInter.begin(), hInter.end(), 0.0f); }
 
+// 频率方向 GRU 的递推：输入投影 P（[3H][F]，含 b_ih）已算好，这里只剩 W_hh·h。H 编译期已知时（HH>0）循环全展开。
+template <int HH>
+static inline void intraRec(const float* __restrict U, const float* __restrict bh, const float* __restrict P, int F, int dir, float* __restrict out, int hrt = 0) {
+    const int H = HH > 0 ? HH : hrt; float h[16] = {0}, g[48];
+    for (int s = 0; s < F; ++s) {
+        const int f = dir ? F - 1 - s : s;
+        for (int k = 0; k < 3 * H; ++k) { const float* ur = U + k * H; float a = bh[k]; for (int i = 0; i < H; ++i) a += ur[i] * h[i]; g[k] = a; }
+        for (int i = 0; i < H; ++i) {
+            const float rg = fsigm(P[(size_t)i * F + f] + g[i]), zg = fsigm(P[(size_t)(H + i) * F + f] + g[H + i]);
+            const float ng = ftanh(P[(size_t)(2 * H + i) * F + f] + rg * g[2 * H + i]);
+            h[i] = (1.0f - zg) * ng + zg * h[i]; out[(size_t)i * F + f] = h[i];
+        }
+    }
+}
+
+// 全部在 (C,F) 布局里算（原写法前后各做一次整块转置）：输入投影、门值、两个全连接都是 [行][F] 的逐点卷积（pw），
+// 时间方向 GRU 在 F 个频点上一次算完（逐元素、可向量化）；频率方向 GRU 的递推里只剩隐状态那一小块。
+// 各量的计算式与累加顺序同旧写法；LayerNorm 对全部 F×C 个元素求均值方差，与布局无关（权重按 (C,F) 预先转置）。
 void DPGRNN::run(float* x) {
-    const int half = C / 2;          // GRNN 把输入按最后一维切两半
-    // (C,F) → (F,C)
-    for (int f = 0; f < F; ++f)
-        for (int c = 0; c < C; ++c) tmp[(size_t)f * C + c] = x[(size_t)c * F + f];
-
+    const int half = C / 2, hh = half / 2;
+    float* __restrict P = pj.data();                     // [3·hh][F]
+    float* __restrict ct = cat.data();                   // [C][F]
     // --- intra：频率方向，双向，两路各吃一半通道 ---
-    {
-        for (int f = 0; f < F; ++f) {
-            memcpy(&in1[(size_t)f * half], &tmp[(size_t)f * C], sizeof(float) * half);
-            memcpy(&in2[(size_t)f * half], &tmp[(size_t)f * C + half], sizeof(float) * half);
+    for (int r = 0; r < 2; ++r) {
+        const float* X = x + (size_t)r * half * F;
+        const float* Wf = r ? i2Wih : i1Wih; const float* Uf = r ? i2Whh : i1Whh; const float* bf = r ? i2bih : i1bih; const float* cf = r ? i2bhh : i1bhh;
+        const float* Wb = r ? i2WihR : i1WihR; const float* Ub = r ? i2WhhR : i1WhhR; const float* bb = r ? i2bihR : i1bihR; const float* cb = r ? i2bhhR : i1bhhR;
+        for (int dir = 0; dir < 2; ++dir) {
+            const float* W = dir ? Wb : Wf; const float* U = dir ? Ub : Uf; const float* bi = dir ? bb : bf; const float* bhh_ = dir ? cb : cf;
+            pw(W, bi, X, P, 3 * hh, half, F);            // 整条序列的输入投影
+            float* out = ct + (size_t)(r * 2 * hh + dir * hh) * F;
+            if (hh == 4) intraRec<4>(U, bhh_, P, F, dir, out); else intraRec<0>(U, bhh_, P, F, dir, out, hh);
         }
-        const int hh = half / 2;     // 双向每个方向的隐层宽度
-        gruBidir(in1.data(), F, half, hh, i1Wih, i1Whh, i1bih, i1bhh,
-                 i1WihR, i1WhhR, i1bihR, i1bhhR, o1.data(), scratch.data());
-        gruBidir(in2.data(), F, half, hh, i2Wih, i2Whh, i2bih, i2bhh,
-                 i2WihR, i2WhhR, i2bihR, i2bhhR, o2.data(), scratch.data());
-        for (int f = 0; f < F; ++f) {
-            memcpy(&cat[(size_t)f * C], &o1[(size_t)f * 2 * hh], sizeof(float) * 2 * hh);
-            memcpy(&cat[(size_t)f * C + 2 * hh], &o2[(size_t)f * 2 * hh], sizeof(float) * 2 * hh);
-        }
-        for (int f = 0; f < F; ++f)
-            linear(&cat[(size_t)f * C], C, ifcW, ifcB, C, &xfc[(size_t)f * C]);
-        layerNorm(xfc.data(), F, C, ilnW, ilnB, 1e-8f);
-        for (size_t i = 0; i < (size_t)F * C; ++i) tmp[i] += xfc[i];
     }
+    pw(ifcW, ifcB, ct, xfc.data(), C, C, F);
+    layerNorm(xfc.data(), F, C, ilnWT.data(), ilnBT.data(), 1e-8f);
+    for (size_t i = 0; i < (size_t)F * C; ++i) x[i] += xfc[i];
 
-    // --- inter：时间方向，单向，每个频点一份状态；T=1 所以就是一步 ---
-    {
-        for (int f = 0; f < F; ++f) {
-            const float* xi = &tmp[(size_t)f * C];
-            float* h = &hInter[(size_t)f * C];
-            gruStep(xi, half, h, half, e1Wih, e1Whh, e1bih, e1bhh, gates.data());
-            gruStep(xi + half, half, h + half, half, e2Wih, e2Whh, e2bih, e2bhh, gates.data());
-            memcpy(&cat[(size_t)f * C], h, sizeof(float) * C);
+    // --- inter：时间方向，单向，每个频点一份状态；T=1 所以就是一步，F 个频点一起算 ---
+    float* __restrict Gx = gx.data(); float* __restrict Gh = gh.data();   // [3·half][F]
+    for (int r = 0; r < 2; ++r) {
+        const float* X = x + (size_t)r * half * F; float* __restrict Hs = hInter.data() + (size_t)r * half * F;
+        pw(r ? e2Wih : e1Wih, r ? e2bih : e1bih, X, Gx, 3 * half, half, F);
+        pw(r ? e2Whh : e1Whh, r ? e2bhh : e1bhh, Hs, Gh, 3 * half, half, F);
+        for (int i = 0; i < half; ++i) {
+            const float *xr = Gx + (size_t)i * F, *xz = Gx + (size_t)(half + i) * F, *xn = Gx + (size_t)(2 * half + i) * F;
+            const float *hr = Gh + (size_t)i * F, *hz = Gh + (size_t)(half + i) * F, *hn = Gh + (size_t)(2 * half + i) * F;
+            float* hs = Hs + (size_t)i * F;
+            for (int f = 0; f < F; ++f) { const float rg = fsigm(xr[f] + hr[f]), zg = fsigm(xz[f] + hz[f]), ng = ftanh(xn[f] + rg * hn[f]); hs[f] = (1.0f - zg) * ng + zg * hs[f]; }
         }
-        for (int f = 0; f < F; ++f)
-            linear(&cat[(size_t)f * C], C, efcW, efcB, C, &xfc[(size_t)f * C]);
-        layerNorm(xfc.data(), F, C, elnW, elnB, 1e-8f);
-        for (size_t i = 0; i < (size_t)F * C; ++i) tmp[i] += xfc[i];
     }
-
-    // (F,C) → (C,F)
-    for (int c = 0; c < C; ++c)
-        for (int f = 0; f < F; ++f) x[(size_t)c * F + f] = tmp[(size_t)f * C + c];
+    pw(efcW, efcB, hInter.data(), xfc.data(), C, C, F);
+    layerNorm(xfc.data(), F, C, elnWT.data(), elnBT.data(), 1e-8f);
+    for (size_t i = 0; i < (size_t)F * C; ++i) x[i] += xfc[i];
 }
 
 }  // namespace ulk
@@ -618,15 +762,29 @@ namespace ulk {
 // **stride==2 时 AffinePReLU 的宽度不是 width**：编码器是 width*2-1，
 // 解码器是 width/2+1 —— 这两行照 XDWSBlock/XMBBlocks 里的 in_width 抄。
 
+static std::vector<int> shuffleSrcToDst(int C2) {   // shuffle2：源行 c → 目的行 2c，源行 C+c → 目的行 2c+1
+    std::vector<int> d(C2); const int C = C2 / 2; for (int c = 0; c < C; ++c) { d[c] = 2 * c; d[C + c] = 2 * c + 1; } return d;
+}
+static std::vector<int> shuffleDstToSrc(int C2) {   // 反过来：目的行 2c ← 源行 c，2c+1 ← C+c
+    std::vector<int> m(C2); const int C = C2 / 2; for (int c = 0; c < C; ++c) { m[2 * c] = c; m[2 * c + 1] = C + c; } return m;
+}
+// 激活并进卷积输出后按卷积的输出行宽逐行做，两者的形状必须一致
+static void checkAct(const Conv& cv, const AffinePReLU& a) {
+    if (a.C != cv.cout || a.nF != cv.fout) throw std::runtime_error("ans48: activation shape does not match conv output");
+}
+// 深度卷积能把前面的洗牌并进读取（只在会走快速路径时）
+static void mapInput(Conv& dc, int C2) { if (dc.sf == 2 || dc.fin == dc.fout) dc.inMap = shuffleDstToSrc(C2); }
+
 static void mkXConv(XConvBlock* B, const Weights& w, const std::string& pfx,
                     int cin, int cout, int width, int kt, int kf, int sf,
                     int groups, int fin, bool deconv, bool isLast) {
     B->conv.prepare(w, pfx + ".ops.1", cin, cout, kt, kf, sf, groups, fin, deconv);
     B->cout = cout; B->fout = B->conv.fout;
     B->useAct = !isLast;
-    if (B->useAct) B->act.prepare(w, pfx + ".ops.3", cout, width);
+    if (B->useAct) { B->act.prepare(w, pfx + ".ops.3", cout, width); checkAct(B->conv, B->act); }
     B->ctfa.prepare(w, pfx + ".ops.4", cout, width);
     B->useShuffle = (!isLast && groups == 2);
+    if (B->useShuffle) B->perm = shuffleSrcToDst(cout);
     B->tmp.assign((size_t)cout * B->fout, 0.0f);
 }
 
@@ -641,7 +799,9 @@ static void mkXDWS(XDWSBlock* B, const Weights& w, const std::string& pfx,
     B->dconv.prepare(w, pfx + ".dconv.1", cout, cout, kt, kf, sf, cout, B->fmid, deconv);
     B->cout = cout; B->fout = B->dconv.fout;
     B->act2.prepare(w, pfx + ".dconv.3", cout, width);
+    checkAct(B->pconv, B->act1); if (B->useAct2) checkAct(B->dconv, B->act2);
     B->ctfa.prepare(w, pfx + ".dconv.4", cout, width);
+    if (B->shuffleP) mapInput(B->dconv, cout);
     B->t1.assign((size_t)B->cmid * B->fmid, 0.0f);
     B->t2.assign((size_t)B->cmid * B->fmid, 0.0f);
 }
@@ -657,10 +817,13 @@ static void mkXMB(XMBBlock* B, const Weights& w, const std::string& pfx,
     B->shuffleP = (groups == 2);
     B->dconv.prepare(w, pfx + ".dconv.1", cout, cout, kt, kf, sf, cout, B->fmid, deconv);
     B->act2.prepare(w, pfx + ".dconv.3", cout, width);
+    checkAct(B->pconv1, B->act1); checkAct(B->dconv, B->act2);
     B->pconv2.prepare(w, pfx + ".pconv2.0", cout, cout, 1, 1, 1, groups, B->dconv.fout, false);
     B->cout = cout; B->fout = B->pconv2.fout;
     B->ctfa.prepare(w, pfx + ".pconv2.2", cout, width);
     B->shuffleOut = (!isLast && groups == 2);
+    if (B->shuffleP) mapInput(B->dconv, cout);
+    if (B->shuffleOut) B->perm = shuffleSrcToDst(cout);
     B->t1.assign((size_t)B->cmid * B->fmid, 0.0f);
     B->t2.assign((size_t)B->cmid * B->fmid, 0.0f);
     B->t3.assign((size_t)cout * B->dconv.fout, 0.0f);
@@ -684,7 +847,12 @@ bool Net::prepare() {
         erbLow = bins - e.shape[1];
         if (e.shape.size() != 2 || erbLow <= 0 || erbHigh <= 0) throw std::runtime_error("ans48: bad erb shape");
     }
-    erbW = w.at("erb.erb_fc.weight").p; ierbW = w.at("erb.ierb_fc.weight").p;   // 每帧不再按名字查（名字超过短串长度，查一次就是一次堆分配）
+    erbW = w.at("erb.erb_fc.weight").p; ierbW = w.at("erb.ierb_fc.weight").p;
+    auto nzRange = [](const float* M, int R, int Cn, std::vector<int>& S, std::vector<int>& E) {
+        S.assign(R, 0); E.assign(R, 0);
+        for (int r = 0; r < R; ++r) { int a = Cn, b = 0; for (int c = 0; c < Cn; ++c) if (M[(size_t)r * Cn + c] != 0.0f) { a = std::min(a, c); b = c + 1; } S[r] = a < b ? a : 0; E[r] = a < b ? b : 0; }
+    };
+    nzRange(erbW, erbHigh, bins - erbLow, erbS, erbE); nzRange(ierbW, bins - erbLow, erbHigh, ierbS, ierbE);   // 每帧不再按名字查（名字超过短串长度，查一次就是一次堆分配）
     const int WF = erbLow + erbHigh;                     // 末块的 final_width
     // 首块输入宽度 = ERB 压缩后的特征宽度（erbLow + erbHigh），不是频点数 bins。
     // 窗 256 / 128 两者恰好相等（129 / 65），窗 1024 不相等（513 ≠ 129）。
@@ -746,8 +914,10 @@ void Net::run(const float* logmag, float* mask) {
     };
     // ERB.bm：前 erbLow 个频点原样，其余投影
     memcpy(feat.data(), logmag, sizeof(float) * erbLow);
-    linear(logmag + erbLow, bins - erbLow, erbW, nullptr,
-           erbHigh, feat.data() + erbLow);
+    {   // ERB 投影：只算每行的非零段（零元素对和没有贡献，结果与满矩阵乘相同）
+        const float* xin = logmag + erbLow; const int Cn = bins - erbLow;
+        for (int r = 0; r < erbHigh; ++r) { const float* wr = erbW + (size_t)r * Cn; float s = 0.0f; for (int c = erbS[r]; c < erbE[r]; ++c) s += wr[c] * xin[c]; feat[erbLow + r] = s; }
+    }
     tick();
 
     en0.run(feat.data(), e0.data()); tick();
@@ -789,12 +959,14 @@ void Net::run(const float* logmag, float* mask) {
     de4.run(t, last);
     if (keepTaps) tapDe[4].assign(last, last + de4.fout);   // sigmoid 之前（= torch 解码末块输出）
 
-    for (int i = 0; i < de4.fout; ++i) last[i] = sigmoidf_(last[i]);
+    for (int i = 0; i < de4.fout; ++i) last[i] = fsigm(last[i]);
 
     // ERB.bs：前 erbLow 原样，其余反投影
     memcpy(mask, last, sizeof(float) * erbLow);
-    linear(last + erbLow, erbHigh, ierbW, nullptr,
-           bins - erbLow, mask + erbLow);
+    {   // ERB 反投影：同上
+        const float* xin = last + erbLow; const int Rn = bins - erbLow;
+        for (int r = 0; r < Rn; ++r) { const float* wr = ierbW + (size_t)r * erbHigh; float s = 0.0f; for (int c = ierbS[r]; c < ierbE[r]; ++c) s += wr[c] * xin[c]; mask[erbLow + r] = s; }
+    }
     tick();
     if (profiling) prof.calls++;
 }

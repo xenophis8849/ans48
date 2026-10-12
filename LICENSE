@@ -5,7 +5,8 @@ Copyright (c) 2026 xenophis8849. All rights reserved.
 未经版权所有者书面许可，不得复制、修改、分发或再许可。
 
 第三方部分按其各自条款使用，见 THIRD_PARTY_NOTICES.md：
+  - third_party/pffft/：pffft（BSD 类许可，原文见 third_party/pffft/LICENSE.txt）；
   - 降噪网络结构与 ERB 滤波器组的算法取自 UL-UNAS（MIT 许可）；
   - test/vec/：测试向量，取自 Microsoft ICASSP 2023 Acoustic Echo Cancellation Challenge 盲测集。
 
-分发包含 libans48.so 的软件时，须在随附文档或其他材料中附上 THIRD_PARTY_NOTICES.md 中 UL-UNAS 的版权声明与许可文本。
+分发包含 libans48.so 的软件时，须在随附文档或其他材料中附上 THIRD_PARTY_NOTICES.md 中 pffft 与 UL-UNAS 的版权声明与许可文本。
