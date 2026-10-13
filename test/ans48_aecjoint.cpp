@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     const double sil = pow(10.0, -70 / 10.0) * 384;   // 近静音块的能量门槛（−70 dBFS）
     auto blkE = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, double* er) { double e = 0, s = 0; for (size_t i = a; i < a + 384; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } *er = e; return s; };
     long cmpN = 0, neqF = 0, neqG = 0; double maxF = 0, maxG = 0, settleMax = 0;
-    int analyzed = 0, ro = 0, roConv = 0, roUnconv = 0, roShort = 0, roSilent = 0;
+    int analyzed = 0, ro = 0, roConv = 0, roUnconv = 0, roShort = 0, roSilent = 0, roThin = 0;
     for (size_t j = 1; j * seg < P; ++j) {
         const size_t s0 = j * seg; if (s0 + 1536 >= L) break;           // 输出里看不到这次切换之后的样本（被 aec 延迟截掉）：不分析，计数里已含
         ++analyzed;
@@ -124,14 +124,19 @@ int main(int argc, char** argv) {
         if (on) {
             ++ro; const size_t hold = (size_t)(0.5 * sr);
             if (e1 < s0 + 1536 + hold) { ++roShort; continue; }
-            size_t t = e1 - (e1 - s0 - 1536) % 384; bool anyLoud = false; size_t conv = t;   // 从段尾往前找最长的「全部达标」尾段
+            // 从段尾往前找最长的「可听块全部达标」尾段。近静音块不参与判定，也不算进持续时长——持续时长只累计可听且达标的块
+            // （10-13 Codex 审查：原写法把近静音尾段算进 0.5 s，一个可听块都没达标也能报收敛）
+            size_t t = e1 - (e1 - s0 - 1536) % 384; bool anyLoud = false, failed = false; size_t conv = t, loudPass = 0;
             for (size_t u = t; u >= s0 + 1536 + 384; u -= 384) {
                 double er; const double sr_ = blkE(G, B1, u - 384, &er);
-                if (sr_ < sil) { conv = u - 384; continue; }          // 近静音块：不参与判定
-                anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) break; conv = u - 384;
+                if (sr_ < sil) { conv = u - 384; continue; }          // 近静音块
+                anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) { failed = true; break; }
+                conv = u - 384; loudPass += 384;
             }
-            if (!anyLoud) { ++roSilent; continue; }
-            if (t - conv >= hold) { ++roConv; settleMax = std::max(settleMax, (double)(conv - s0) / sr); } else ++roUnconv;
+            if (!anyLoud) ++roSilent;
+            else if (loudPass >= hold) { ++roConv; settleMax = std::max(settleMax, (double)(conv - s0) / sr); }
+            else if (failed) ++roUnconv;
+            else ++roThin;                                             // 可听块全都达标，但合计不到 0.5 s：证据不足
         }
     }
     bool fin = true; for (const std::vector<float>* v : std::initializer_list<const std::vector<float>*>{&A, &B1, &C2, &D1, &E2, &F, &G}) for (float x : *v) if (!std::isfinite(x)) fin = false;
@@ -139,10 +144,10 @@ int main(int argc, char** argv) {
            "\"switches_applied_F\":%d,\"switches_applied_G\":%d,\"switches_analyzed\":%d,"
            "\"steady_cmp\":%ld,\"steady_neq_F\":%ld,\"steady_maxabs_F\":%.3g,\"steady_neq_G_off\":%ld,\"steady_maxabs_G_off\":%.3g,"
            
-           "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"settle_max_s\":%.3f,"
+           "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"reopen_thin\":%d,\"settle_max_s\":%.3f,"
            "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld}\n",
            L, fin ? "true" : "false", rmsDb(mic, 0, L), rmsDb(A, 0, L), rmsDb(B1, 0, L), rmsDb(C2, 0, L), rmsDb(D1, 0, std::min(L, D1.size())), rmsDb(E2, 0, std::min(L, E2.size())),
-           appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, settleMax,
+           appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, roThin, settleMax,
            nfB, nfF, frOn, frOff, frBad, nfG, expectG);
     ans48_destroy(n); return 0;
 }
