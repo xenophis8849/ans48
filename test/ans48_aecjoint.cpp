@@ -35,9 +35,9 @@ enum Tog { NONE, GAIN, HOOK };
 
 // 帧级记录：包一层 ans48_spec_frame，逐帧记下进 / 出的频谱和当时的强度（10-13 挑战式审查后加：输出波形上的过渡是 aec48 合成时的重叠相加，
 // 频谱档自己有没有出异常要在帧上核——强度切换时每一帧必须要么与一直开着那次的同一帧逐位相同，要么原样返回）
-struct Rec { Ans48* n = nullptr; std::vector<float> in, out, g; };
+struct Rec { Ans48* n = nullptr; std::vector<float> in, out, g; long curBlk = -1; std::vector<long> blk; };   // blk：每次回调发生在第几块
 static void recHook(void* u, float* re, float* im, int bins) {
-    Rec* r = (Rec*)u; r->in.insert(r->in.end(), re, re + bins); r->in.insert(r->in.end(), im, im + bins);
+    Rec* r = (Rec*)u; r->blk.push_back(r->curBlk); r->in.insert(r->in.end(), re, re + bins); r->in.insert(r->in.end(), im, im + bins);
     r->g.push_back(ans48_get_strength(r->n));
     ans48_spec_frame(r->n, re, im, bins);
     r->out.insert(r->out.end(), re, re + bins); r->out.insert(r->out.end(), im, im + bins);
@@ -47,7 +47,7 @@ static std::vector<float> runChain(const std::vector<float>& mic, const std::vec
     const int B = 384; Aec48* a = aec48_create(sr, B); if (!a) { fprintf(stderr, "aec48_create 失败\n"); exit(2); }
     const int lat = aec48_latency_samples(a);
     if (n) { ans48_reset(n); ans48_set_strength(n, g);
-        if (rec) { rec->n = n; rec->in.clear(); rec->out.clear(); rec->g.clear(); aec48_set_spec_hook(a, recHook, rec); } else aec48_set_spec_hook(a, ans48_spec_frame, n); }
+        if (rec) { rec->n = n; rec->in.clear(); rec->out.clear(); rec->g.clear(); rec->blk.clear(); aec48_set_spec_hook(a, recHook, rec); } else aec48_set_spec_hook(a, ans48_spec_frame, n); }
     std::vector<float> y; y.reserve(mic.size() + B); std::vector<float> out(B);
     for (size_t i = 0, k = 0; i + B <= mic.size(); i += B, ++k) {
         if (tog != NONE && k > 0 && k % togBlocks == 0) {
@@ -55,6 +55,7 @@ static std::vector<float> runChain(const std::vector<float>& mic, const std::vec
             if (tog == GAIN) ans48_set_strength(n, on ? g : 0.f); else aec48_set_spec_hook_enabled(a, on ? 1 : 0);
             if (applied) ++*applied;   // 实际执行的切换，在执行时计数（10-13 挑战式审查：分析口径的计数会漏掉末尾的切换）
         }
+        if (rec) rec->curBlk = (long)k;
         aec48_process(a, &mic[i], &ref[i], out.data(), B); y.insert(y.end(), out.begin(), out.end());
     }
     aec48_destroy(a);
@@ -85,7 +86,25 @@ int main(int argc, char** argv) {
         if (recF.g[c] == 1.f) { ++frOn; if (!inSame || memcmp(fo, bo, 2 * BN * 4)) ++frBad; }
         else { ++frOff; if (memcmp(fo, fi, 2 * BN * 4)) ++frBad; }
     }
-    // 挂钩开关：关着时回调不被调用——G 的帧数应 = 开着的块数；开着的帧进来的频谱与 B 同一时刻的相同
+    // 挂钩开关的调用序列（10-13 挑战式审查：只比总数时，关着时多调一次、开着时少调一次会相互抵消）：
+    // 逐块核对 G 的回调是否恰好发生在开着的块上（缺 / 多 / 重复分开报），并把每次回调进来的频谱与 B 同一块的逐位比。
+    // 开关在第 k 块 process 之前设置；按 aec48 说明「下一块起生效」，这里以实测的序列为准：先按「第 k 块即生效」比，不符的另报。
+    long gMissing = 0, gExtra = 0, gDup = 0, gInNeq = 0;
+    {
+        const long nb = (long)(mic.size() / 384);
+        std::vector<long> bIdx(nb, -1); for (size_t c = 0; c < recB.blk.size(); ++c) if (recB.blk[c] >= 0 && recB.blk[c] < nb) bIdx[recB.blk[c]] = (long)c;
+        std::vector<int> seen(nb, 0); for (long b : recG.blk) if (b >= 0 && b < nb) seen[b]++;
+        for (long k = 1; k < nb; ++k) {
+            const bool on = ((k / togBlocks) % 2) == 0;
+            if (seen[k] > 1) gDup += seen[k] - 1;
+            if (on && !seen[k]) ++gMissing;
+            if (!on && seen[k]) ++gExtra;
+        }
+        for (size_t c = 0; c < recG.blk.size(); ++c) {
+            const long b = recG.blk[c]; if (b < 0 || b >= nb || bIdx[b] < 0) { ++gInNeq; continue; }
+            if (memcmp(&recG.in[c * 2 * BN], &recB.in[(size_t)bIdx[b] * 2 * BN], 2 * BN * 4)) ++gInNeq;
+        }
+    }
     const long expectG = [&] { long k = 0; const size_t nb = mic.size() / 384; for (size_t b = 1; b < nb; ++b) { if (((b / togBlocks) % 2) == 0) ++k; } return k; }();
     std::vector<float> D1, E2;
     for (float g : {1.f, 2.f}) {   // 旧接法：aec48 输出（波形）→ 推流档
@@ -108,7 +127,7 @@ int main(int argc, char** argv) {
     const double sil = pow(10.0, -70 / 10.0) * 384;   // 近静音块的能量门槛（−70 dBFS）
     auto blkE = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, double* er) { double e = 0, s = 0; for (size_t i = a; i < a + 384; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } *er = e; return s; };
     long cmpN = 0, neqF = 0, neqG = 0; double maxF = 0, maxG = 0, settleMax = 0;
-    int analyzed = 0, ro = 0, roConv = 0, roUnconv = 0, roShort = 0, roSilent = 0, roThin = 0;
+    int analyzed = 0, ro = 0, roConv = 0, roUnconv = 0, roShort = 0, roSilent = 0, roThin = 0; std::string winRows;
     for (size_t j = 1; j * seg < P; ++j) {
         const size_t s0 = j * seg; if (s0 + 1536 >= L) break;           // 输出里看不到这次切换之后的样本（被 aec 延迟截掉）：不分析，计数里已含
         ++analyzed;
@@ -133,6 +152,17 @@ int main(int argc, char** argv) {
                 anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) { failed = true; break; }
                 conv = u - 384; loudPass += 384;
             }
+            // 按时间窗记误差（浮点域；每窗累加非近静音块的误差能量与 B 能量，窗内没有可听块就记 NaN）。窗从过渡带之后算起。
+            {
+                static const double W[6] = {0.0, 0.1, 0.3, 0.6, 1.0, 1.5}; std::string row = "[";
+                for (int w = 0; w < 5; ++w) {
+                    const size_t x0 = s0 + 1536 + (size_t)(W[w] * sr), x1 = s0 + 1536 + (size_t)(W[w + 1] * sr); double E = 0, S2 = 0;
+                    if (x1 <= e1) for (size_t u = x0; u + 384 <= x1; u += 384) { double er; const double sr_ = blkE(G, B1, u, &er); if (sr_ < sil) continue; E += er; S2 += sr_; }
+                    char b[32]; if (x1 <= e1 && S2 > 0) snprintf(b, sizeof b, "%.2f", 10 * log10(E / S2 + 1e-30)); else snprintf(b, sizeof b, "null");
+                    row += (w ? "," : ""); row += b;
+                }
+                winRows += (winRows.empty() ? "" : ",") + row + "]";
+            }
             if (!anyLoud) ++roSilent;
             else if (loudPass >= hold) { ++roConv; settleMax = std::max(settleMax, (double)(conv - s0) / sr); }
             else if (failed) ++roUnconv;
@@ -145,9 +175,10 @@ int main(int argc, char** argv) {
            "\"steady_cmp\":%ld,\"steady_neq_F\":%ld,\"steady_maxabs_F\":%.3g,\"steady_neq_G_off\":%ld,\"steady_maxabs_G_off\":%.3g,"
            
            "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"reopen_thin\":%d,\"settle_max_s\":%.3f,"
-           "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld}\n",
+           "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld,"
+           "\"G_missing\":%ld,\"G_extra\":%ld,\"G_dup\":%ld,\"G_in_neq_B\":%ld,\"reopen_win_db\":[%s]}\n",
            L, fin ? "true" : "false", rmsDb(mic, 0, L), rmsDb(A, 0, L), rmsDb(B1, 0, L), rmsDb(C2, 0, L), rmsDb(D1, 0, std::min(L, D1.size())), rmsDb(E2, 0, std::min(L, E2.size())),
            appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, roThin, settleMax,
-           nfB, nfF, frOn, frOff, frBad, nfG, expectG);
+           nfB, nfF, frOn, frOff, frBad, nfG, expectG, gMissing, gExtra, gDup, gInNeq, winRows.c_str());
     ans48_destroy(n); return 0;
 }
