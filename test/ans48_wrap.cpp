@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-extern "C" { extern const unsigned char ans48_w1024_48k_bin[]; extern const unsigned long ans48_w1024_48k_bin_size; extern const unsigned char ans48_w1024_48k_json[];
+extern "C" { extern const unsigned char ans48_w1024_bin[]; extern const unsigned long ans48_w1024_bin_size; extern const unsigned char ans48_w1024_48k_json[];
              extern const unsigned char ans48_w256_bin[]; extern const unsigned long ans48_w256_bin_size; extern const unsigned char ans48_w256_48k_json[]; }
 static int run(const unsigned char* bin, unsigned long n, const unsigned char* js, const std::vector<float>& x, uint64_t start, std::vector<float>& y, uint64_t* endR = nullptr, uint64_t* endW = nullptr) {
     ulk::Net net; if (!net.w.loadFromMemory(bin, n, (const char*)js) || !net.prepare()) return 1; net.reset();
@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
     if (got < s.size()) { fprintf(stderr, "输入不足 3 s（%zu 样本）：覆盖不到回绕点，判失败\n", got); return 1; }
     std::vector<float> x(s.size()); for (size_t i = 0; i < s.size(); ++i) x[i] = s[i] / 32768.f;
     int fails = 0;
-    struct M { const char* name; const unsigned char* bin; unsigned long n; const unsigned char* js; } ms[] = {{"推流", ans48_w1024_48k_bin, ans48_w1024_48k_bin_size, ans48_w1024_48k_json}, {"耳返", ans48_w256_bin, ans48_w256_bin_size, ans48_w256_48k_json}};
+    struct M { const char* name; const unsigned char* bin; unsigned long n; const unsigned char* js; } ms[] = {{"推流", ans48_w1024_bin, ans48_w1024_bin_size, ans48_w1024_48k_json}, {"耳返", ans48_w256_bin, ans48_w256_bin_size, ans48_w256_48k_json}};
     for (const M& m : ms) {
         std::vector<float> ref, y; if (run(m.bin, m.n, m.js, x, 0, ref)) return 1;
         for (uint64_t start : {(uint64_t)0xFFFFFFFFull - 20000, (uint64_t)0xFFFFFFFFFFFFFFFFull - 20000}) {

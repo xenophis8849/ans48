@@ -1,0 +1,58 @@
+{
+ "contract": "aec48 联动接口契约版本 1",
+ "n_fft": 1536,
+ "hop": 384,
+ "pad_left": 768,
+ "ckpt": "data/ans48_spec/final/best.pt",
+ "gammas": [
+  1.0,
+  2.0,
+  0.5
+ ],
+ "skip_head": 768,
+ "skip_tail": 1536,
+ "files": {
+  "00d2fda6_spec_48k_g1.pcm": {
+   "fs": 48000,
+   "gamma": 1.0,
+   "frames": 1249,
+   "samples": 480000,
+   "input": "00d2fda6_in48k.pcm"
+  },
+  "00d2fda6_spec_48k_g2.pcm": {
+   "fs": 48000,
+   "gamma": 2.0,
+   "frames": 1249,
+   "samples": 480000,
+   "input": "00d2fda6_in48k.pcm"
+  },
+  "00d2fda6_spec_48k_g0.5.pcm": {
+   "fs": 48000,
+   "gamma": 0.5,
+   "frames": 1249,
+   "samples": 480000,
+   "input": "00d2fda6_in48k.pcm"
+  },
+  "00d2fda6_spec_441_g1.pcm": {
+   "fs": 44100,
+   "gamma": 1.0,
+   "frames": 1147,
+   "samples": 440832,
+   "input": "00d2fda6_in441.pcm"
+  },
+  "00d2fda6_spec_441_g2.pcm": {
+   "fs": 44100,
+   "gamma": 2.0,
+   "frames": 1147,
+   "samples": 440832,
+   "input": "00d2fda6_in441.pcm"
+  },
+  "00d2fda6_spec_441_g0.5.pcm": {
+   "fs": 44100,
+   "gamma": 0.5,
+   "frames": 1147,
+   "samples": 440832,
+   "input": "00d2fda6_in441.pcm"
+  }
+ }
+}

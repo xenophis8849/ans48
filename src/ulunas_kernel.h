@@ -60,6 +60,8 @@ struct FA {
     const float *WihR = nullptr, *WhhR = nullptr, *bihR = nullptr, *bhhR = nullptr;
     const float *fcW = nullptr, *fcB = nullptr;
     std::vector<float> pad, gruOut, scratch;
+    // 向量化用的转置权重（10-13）：每个方向、每个门 (r,z,n) 一组 4 列，每列 4 个数 = 该门 4 个隐单元对第 i 个输入的权重
+    std::vector<float> wx, wh, bx, bh, fcT;   // wx/wh: [方向 2][门 3][输入 4][4]；bx/bh: [方向 2][门 3][4]；fcT: [输入 8][4]
     void prepare(const Weights& w, const std::string& pfx, int nFreq);
     void run(const float* x, int C, float* out /*nF*/);
 };
@@ -90,11 +92,16 @@ struct AffinePReLU {
     }
 };
 
+constexpr int kMaxTaps = 16;   // 深度卷积 kt×kf 的上限（模型里最大 2×3 / 1×5；prepare 里校验）
 /** 二维卷积，时间维 kt（吃历史缓冲）、频率维 kf（补零 kf/2）、频率步长 sf。 */
 struct Conv {
     std::vector<float> zb;   // 无偏置时的零偏置（逐点快速路径用）
+    std::vector<std::vector<float>> pwPack;   // 逐点快速路径：每组一份转置打包的权重（packPw）
     std::vector<float> padr; // 深度卷积 / 步长 2 快速路径的补零行
-    std::vector<float> accr; // 步长 2 转置卷积的累加行
+    std::vector<float> accr; // 步长 2 转置卷积：奇偶两条输出子序列的暂存
+    std::vector<float> padAll;          // 步长 2：全部输入行（通道 × 时间帧）补零后放一起，各输出通道共用
+    int padL = 0, padRowLen = 0;
+    std::vector<float> tapW; std::vector<const float*> tapP;   // 步长 2：一个输出通道的全部抽头（权重 + 对应输入位置）
     std::vector<int> inMap;  // 非空：第 c 个输入通道取输入的第 inMap[c] 行（把前面的通道洗牌并进读取，只有深度卷积 / 步长 2 快速路径支持）
     int cin = 0, cout = 0, kt = 1, kf = 1, sf = 1, groups = 1;
     int fin = 0, fout = 0;
@@ -108,6 +115,9 @@ struct Conv {
     // post 非空：输出每写完一行就地接激活（省掉激活单独一遍整块读写）
     void run(const float* x /*(cin,fin)*/, float* y /*(cout,fout)*/, const AffinePReLU* post = nullptr);
 };
+
+/** 逐点卷积权重转置打包（见 ulunas_kernel.cpp 的 pw）。 */
+std::vector<float> packPw(const float* w, int O, int I);
 
 /** 通道洗牌：(2C,F) 交错两半。 */
 void shuffle2(const float* x, int C2, int nF, float* y);
@@ -161,6 +171,8 @@ struct DPGRNN {
     std::vector<float> hInter, xfc, cat;
     // (C,F) 布局版用：输入投影 / 门值 [3H][F]、两个 LayerNorm 的转置权重（原权重按 (F,C) 排）
     std::vector<float> pj, gx, gh, ilnWT, ilnBT, elnWT, elnBT;
+    std::vector<float> pkIntra[4], pkIfc, pkEfc, pkEx[2], pkEh[2];
+    std::vector<float> pj4, uT4, bh4;   // 隐层 4 时：4 条频率递推各自的输入投影、转置的 U、b_hh（intraRec4x）   // 各逐点投影 / 全连接的转置打包权重（packPw）
     void prepare(const Weights& w, const std::string& pfx, int channels, int width);
     void reset();
     void run(float* x /*就地 (C,F)*/);
@@ -168,6 +180,12 @@ struct DPGRNN {
 
 /** 逐块耗时（纳秒累计）。**先量再优化**——这个图里 17 个卷积、26 个矩阵乘、
  *  28 个 GRU，凭直觉挑错地方优化会白干一整轮。 */
+// 按算子类别计时的类别（只在 -DULK_OPPROF 构建里计数）
+enum { kOpPw = 0, kOpConv, kOpTa, kOpFa, kOpMul, kOpDp, kOpTop, kOpDpRec = kOpTop, kOpDpPw, kOpDpLn, kOpDpGate, kOpCats };   // kOpTop 之后的是 DPGRNN 内部的细分（嵌套，不另加总）
+#ifdef ULK_OPPROF
+extern long long g_opns[kOpCats];
+#endif
+
 struct Profile {
     static constexpr int kSlots = 13;
     long long ns[kSlots] = {0};
