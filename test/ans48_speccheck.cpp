@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
         check(a != nullptr, std::to_string(sr) + " Hz 建频谱档实例");
         if (!a) continue;
         check(ans48_latency_samples(a) == 0 && fabsf(ans48_max_strength(a) - 2.f) < 1e-6f, "延迟 0、强度上限 2");
+        check(ans48_get_strength(a) == 1.f, "不设强度时默认 1");
         float f1 = 0, f2 = 0; check(ans48_process(a, &f1, &f2, 1) == -1, "频谱档上调 ans48_process 返回 -1");
         // bins 不符 / 空指针：原样返回
         std::vector<float> r(B, 0.5f), i2(B, 0.25f); ans48_spec_frame(a, r.data(), i2.data(), B - 1); ans48_spec_frame(nullptr, r.data(), i2.data(), B);
