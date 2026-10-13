@@ -79,7 +79,18 @@ int main(int argc, char** argv) {
     const auto G = runChain(mic, ref, sr, n, 1.f, HOOK, togBlocks, &appliedG, &recG);
     // 帧级核对
     const int BN = nfft / 2 + 1; const size_t nfB = recB.g.size(), nfF = recF.g.size(), nfG = recG.g.size();
-    long frOn = 0, frOff = 0, frBad = 0;
+    long frOn = 0, frOff = 0, frBad = 0, seqBad = 0;
+    {   // 回调序列：B、F 都应在第 1 块起的每一块恰好回调一次（10-13 挑战式审查：只比共有前缀会漏掉缺帧 / 多帧）；
+        // F 每帧的强度应等于该块按切换表应有的值（1 = 开，0 = 关）
+        const long nb = (long)(mic.size() / 384);
+        if ((long)nfB != nb - 1 || (long)nfF != nb - 1) ++seqBad;
+        for (size_t c = 0; c < nfB; ++c) if (recB.blk[c] != (long)c + 1) ++seqBad;
+        for (size_t c = 0; c < nfF; ++c) {
+            if (recF.blk[c] != (long)c + 1) { ++seqBad; continue; }
+            const bool on = ((recF.blk[c] / togBlocks) % 2) == 0;
+            if (recF.g[c] != (on ? 1.f : 0.f)) ++seqBad;
+        }
+    }
     for (size_t c = 0; c < std::min(nfB, nfF); ++c) {
         const float* fo = &recF.out[c * 2 * BN]; const float* fi = &recF.in[c * 2 * BN]; const float* bo = &recB.out[c * 2 * BN]; const float* bi = &recB.in[c * 2 * BN];
         const bool inSame = !memcmp(fi, bi, 2 * BN * 4);   // 两次跑进来的频谱应相同（aec48 不受回调输出影响）
@@ -122,7 +133,8 @@ int main(int argc, char** argv) {
     //   切换本身有没有引入异常：在帧上核（见 main 开头的帧级核对），输出波形上的过渡是 aec48 合成时的重叠相加。
     //   （曾试过「过渡带输出应落在开 / 关两路之间」的逐样本指标：重叠相加时每个样本由几帧叠成，正常过渡也不必落在两路之间，
     //     分不清毛刺与正常过渡，已删，10-13。）
-    //   挂钩重开的收敛：块级（384 样本）误差能量相对 B 的同块能量 < −40 dB、并持续 ≥ 0.5 s 才算收敛；B 那块低于 −70 dBFS 的近静音块不参与判定。
+    //   挂钩重开的收敛（「回到并保持」）：存在某一时刻，从它起直到观察区间结束，每个可听块（384 样本，B 那块不低于 −70 dBFS）的
+//   误差能量相对 B 同块能量都 < −40 dB，且这段里的可听块合计 ≥ 0.5 s。中途达标、到观察末尾又超标的算未收敛。
     const size_t seg = (size_t)togBlocks * 384, L = std::min({A.size(), B1.size(), F.size(), G.size()}), P = mic.size() / 384 * 384;
     const double sil = pow(10.0, -70 / 10.0) * 384;   // 近静音块的能量门槛（−70 dBFS）
     auto blkE = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, double* er) { double e = 0, s = 0; for (size_t i = a; i < a + 384; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } *er = e; return s; };
@@ -178,10 +190,10 @@ int main(int argc, char** argv) {
            "\"steady_cmp\":%ld,\"steady_neq_F\":%ld,\"steady_maxabs_F\":%.3g,\"steady_neq_G_off\":%ld,\"steady_maxabs_G_off\":%.3g,"
            
            "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"reopen_thin\":%d,\"settle_max_s\":%.3f,"
-           "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld,"
+           "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_seq_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld,"
            "\"G_missing\":%ld,\"G_extra\":%ld,\"G_dup\":%ld,\"G_in_neq_B\":%ld,\"reopen_win_db\":[%s]}\n",
            L, Lc, fin ? "true" : "false", rmsDb(mic, 0, Lc), rmsDb(A, 0, Lc), rmsDb(B1, 0, Lc), rmsDb(C2, 0, Lc), rmsDb(D1, 0, Lc), rmsDb(E2, 0, Lc),
            appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, roThin, settleMax,
-           nfB, nfF, frOn, frOff, frBad, nfG, expectG, gMissing, gExtra, gDup, gInNeq, winRows.c_str());
+           nfB, nfF, frOn, frOff, frBad, seqBad, nfG, expectG, gMissing, gExtra, gDup, gInNeq, winRows.c_str());
     ans48_destroy(n); return 0;
 }

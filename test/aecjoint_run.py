@@ -13,6 +13,8 @@
     窗内没有可听块或窗超出观察区间记为空。每次重开都出一行（含观察不足的），这里对全部条、全部重开的同一时间窗取中位数、
     90% 分位与最大值，空值不计。
   收敛分类：观察区间是过渡带之后到下一次关的过渡带之前（每 2 s 切一次，约 1.94 s），与误差时间窗（到 1.5 s）不是同一个。
+    「收敛」= 回到并保持：从某一时刻起直到观察区间结束，可听块（一直挂着那块不低于 −70 dBFS）的误差都 < −40 dB，且这段可听块合计 ≥ 0.5 s；
+    中途达标、到末尾又超标的算未收敛。
   电平：各路在同一区间上比（取各路共同长度）。
   任一条联调程序失败：打印失败条目并以非零状态退出（汇总不完整）。
 """
@@ -77,7 +79,7 @@ def summarize(r):
     print(f"条数 {len(r)}，输出全部有限 {all(x['finite'] for x in r)}")
     print(f"切换：执行 {S('switches_applied_F')}（强度）/ {S('switches_applied_G')}（挂钩），已分析 {S('switches_analyzed')}")
     print(f"稳态浮点位比较 {S('steady_cmp')} 个样本，不相等：强度切换 {S('steady_neq_F')}，挂钩关段 {S('steady_neq_G_off')}")
-    print(f"强度切换帧级：开 {S('frames_F_on')} + 关 {S('frames_F_off')} 帧，例外 {S('frames_F_bad')}")
+    print(f"强度切换帧级：开 {S('frames_F_on')} + 关 {S('frames_F_off')} 帧，例外 {S('frames_F_bad')}；回调序列（一直挂着 / 强度切换每块恰好一次、强度与切换表相符）不符 {S('frames_seq_bad')}")
     print(f"挂钩回调序列：回调 {S('frames_G')} 次（应 {S('frames_G_expect')}），缺 {S('G_missing')}、多 {S('G_extra')}、重复 {S('G_dup')}，进来的频谱与一直挂着同一块不等 {S('G_in_neq_B')}")
     print(f"挂钩重开 {S('reopen')} 次：收敛 {S('reopen_converged')}、未收敛 {S('reopen_unconverged')}、证据不足 {S('reopen_thin')}、观察不足 {S('reopen_short')}、近静音 {S('reopen_silent')}；收敛最长 {max(x['settle_max_s'] for x in r):.2f} s")
     W = ["0–0.1", "0.1–0.3", "0.3–0.6", "0.6–1.0", "1.0–1.5"]
