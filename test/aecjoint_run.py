@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """与 aec48 联调的批量跑与汇总（README「联调结果」的数字由它复现）。
 素材：公开的 ICASSP 2023 AEC Challenge 盲测集（48 kHz wav，<目录>/{doubletalk,farend-singletalk,nearend-singletalk}/<id>_{mic,lpb}.wav）。
-选条：双讲 13 条（下表）、远端单讲与近端单讲各取文件名排序后的前 6 条。
+选条：双讲 13 条、远端单讲 6 条、近端单讲 6 条，都是下面写死的清单。运行前逐条核对 mic / lpb 两个文件都在，缺任何一个就退出非零，
+  不会自动换成别的条（10-13 挑战式审查：原写法单讲按排序取前 6，目录缺失时会静默少一类）。
 用法：python3 test/aecjoint_run.py <ans48_aecjoint 可执行文件> <盲测集目录> <输出目录>
 每条写一行 JSON 到 <输出目录>/joint.jsonl，最后打印汇总。
 
@@ -10,11 +11,12 @@
   挂钩重开后的误差：ans48_aecjoint 对每次重开、每个时间窗（从过渡带之后算起 0–0.1 / 0.1–0.3 / 0.3–0.6 / 0.6–1.0 / 1.0–1.5 s），
     在浮点域累加「与一直挂着的误差能量」和「一直挂着那路的能量」（一直挂着那块低于 −70 dBFS 的近静音块两项都不计），取两者之比（dB）；
     窗内没有可听块或窗超出观察区间记为空。每次重开都出一行（含观察不足的），这里对全部条、全部重开的同一时间窗取中位数、
-    90% 分位与最大值，空值不计。观察窗止于下一次关（每 2 s 切一次），所以 1.5 s 以后的情况本测试不覆盖。
+    90% 分位与最大值，空值不计。
+  收敛分类：观察区间是过渡带之后到下一次关的过渡带之前（每 2 s 切一次，约 1.94 s），与误差时间窗（到 1.5 s）不是同一个。
   电平：各路在同一区间上比（取各路共同长度）。
   任一条联调程序失败：打印失败条目并以非零状态退出（汇总不完整）。
 """
-import os, sys, json, glob, subprocess
+import os, sys, json, subprocess
 import numpy as np
 import soundfile as sf
 
@@ -35,12 +37,21 @@ DT = [
 ]
 
 
+FE = ["00RUTexyKEaW0VCzjL9QYg", "03ra86gHhkWD5ttLpOXWkA", "04281ceb-b127-417e-a2f8-50ccd1a958be",
+      "043c0213-3af9-4ccb-ad28-68df92069627", "051aec4b-cdfb-48b7-8c9e-0325262b920b", "0DDAYMovP0eS1P4rWEh0QA"]
+NE = ["00d2fda6-46a5-4380-933d-335f4e00bd86", "00t5hG031EmZTpJtcnhS0g", "0132ca07-7891-461a-9944-c78f0208e1f0",
+      "02a565aa-ca43-4023-8362-0e38d9f45202", "02f2lbI4f0Kj67Vu4oqmJg", "03ra86gHhkWD5ttLpOXWkA"]
+
+
 def main():
     exe, bs, out = sys.argv[1], sys.argv[2], sys.argv[3]
     os.makedirs(out, exist_ok=True)
     items = [("双讲", f"{bs}/doubletalk/{n}_mic.wav") for n in DT]
-    items += [("远端单讲", p) for p in sorted(glob.glob(f"{bs}/farend-singletalk/*_mic.wav"))[:6]]
-    items += [("近端单讲", p) for p in sorted(glob.glob(f"{bs}/nearend-singletalk/*_mic.wav"))[:6]]
+    items += [("远端单讲", f"{bs}/farend-singletalk/{n}_farend-singletalk_mic.wav") for n in FE]
+    items += [("近端单讲", f"{bs}/nearend-singletalk/{n}_nearend-singletalk_mic.wav") for n in NE]
+    missing = [p for _, m in items for p in (m, m.replace("_mic.wav", "_lpb.wav")) if not os.path.isfile(p)]
+    if missing:
+        print(f"素材不全，缺 {len(missing)} 个文件：", *missing[:10], sep="\n  "); sys.exit(2)
     rows, fails = [], []
     for kind, mic in items:
         name = os.path.basename(mic)[:-len("_mic.wav")]; d = os.path.join(out, name); os.makedirs(d, exist_ok=True)
