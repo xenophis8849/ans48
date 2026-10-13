@@ -78,12 +78,15 @@ int main(int argc, char** argv) {
         double e = 0, s = 0; for (size_t i = a; i < b && i < L; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } return 10 * log10(e / (s + 1e-20) + 1e-20); };
     double fSteady = -300, gSteady = -300, fJump = 0, gJump = 0, settleMax = 0; int nsw = 0, nReopen = 0, nUnsettled = 0;
     // 遍历每个实际发生的切换（最后一段不满 2 s 也算，只要切换点之后还有一个过渡带的样本）——10-13 Codex 审查指出原写法漏掉末次切换
-    for (size_t j = 1; j * seg + 1536 < L; ++j) {
+    // 「后面还有没有切换」按实际处理过的输入长度判断，不按挪掉 aec 延迟后的输出长度 L：切换落在输入末尾几块里时已经生效，
+    // 但它的输出过渡带被延迟截在 L 之外（10-13 Codex 复审指出）
+    const size_t P = mic.size() / 384 * 384;
+    for (size_t j = 1; j * seg < P && j * seg + 1536 < L; ++j) {
         const bool on = j % 2 == 0; const std::vector<float>& ref_ = on ? B1 : A;
-        const size_t s0 = j * seg; const bool last = (j + 1) * seg >= L; const size_t s1 = last ? L : (j + 1) * seg;
-        // 稳态：过渡带之后到段末。下一次切换后算出的第一帧，窗口覆盖切换点之前约 1000 个样本，所以段尾也要让开 1536 个样本
-        // （10-13 实测：差异全在段尾这一截）；最后一段后面没有切换，不用让
-        const size_t e1 = last ? s1 : s1 - 1536;
+        const size_t s0 = j * seg; const bool nextSw = (j + 1) * seg < P; const size_t s1 = std::min((j + 1) * seg, L);
+        // 稳态：过渡带之后到段末。下一次切换后算出的第一帧，窗口覆盖切换点之前约 1000 个样本，所以有下一次切换时段尾要让开 1536 个样本
+        // （10-13 实测：差异全在段尾这一截）；后面确实没有切换才不用让
+        const size_t e1 = nextSw ? std::min((j + 1) * seg - 1536, L) : L;
         if (e1 > s0 + 1536 + 384) {
             fSteady = std::max(fSteady, devDb(F, ref_, s0 + 1536, e1));
             if (!on) gSteady = std::max(gSteady, devDb(G, A, s0 + 1536, e1));
