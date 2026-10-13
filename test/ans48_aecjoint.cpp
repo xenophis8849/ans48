@@ -7,8 +7,8 @@
 //   D_serial_g1 aec48 输出合成成声音后再串推流档 γ1（旧接法，多 1024 样本延迟，已挪齐）  E_serial_g2  同，γ2
 //   F_tog_gain  频谱档 γ1，每 2 s 在强度 1 ↔ 0 之间切（推荐的临时关法）
 //   G_tog_hook  频谱档 γ1，每 2 s 用 aec48 的挂钩开关关 / 开（关的那段 ans48 收不到帧）
-// 标准输出一行 JSON：各路电平；F / G 对「分段参照」（开的段取 B、关的段取 A）在每个切换点之后的偏差，
-// 以及 G 重新打开后多久才持续回到与 B 相差 < −40 dB（旧记忆的影响时长；持续 0.5 s 以上才算，观察窗内没做到的计为未收敛）。
+// 标准输出一行 JSON：各路电平；实际执行 / 已分析的切换数；稳态逐样本（浮点位）比较；帧级核对（强度切换时每帧与一直开着逐位相同或原样返回）；
+// 挂钩重开的收敛分类（收敛 / 未收敛 / 观察不足 / 近静音）。定义见 main 里切换分析一节。
 #include "aec48.h"
 #include "ans48.h"
 #include <algorithm>
@@ -32,16 +32,28 @@ static void wr(const std::string& p, const std::vector<float>& y) {
 static double rmsDb(const std::vector<float>& v, size_t a, size_t b) { double e = 0; for (size_t i = a; i < b && i < v.size(); ++i) e += (double)v[i] * v[i]; return 10 * log10(e / std::max<size_t>(1, b - a) + 1e-20); }
 
 enum Tog { NONE, GAIN, HOOK };
+
+// 帧级记录：包一层 ans48_spec_frame，逐帧记下进 / 出的频谱和当时的强度（10-13 挑战式审查后加：输出波形上的过渡是 aec48 合成时的重叠相加，
+// 频谱档自己有没有出异常要在帧上核——强度切换时每一帧必须要么与一直开着那次的同一帧逐位相同，要么原样返回）
+struct Rec { Ans48* n = nullptr; std::vector<float> in, out, g; };
+static void recHook(void* u, float* re, float* im, int bins) {
+    Rec* r = (Rec*)u; r->in.insert(r->in.end(), re, re + bins); r->in.insert(r->in.end(), im, im + bins);
+    r->g.push_back(ans48_get_strength(r->n));
+    ans48_spec_frame(r->n, re, im, bins);
+    r->out.insert(r->out.end(), re, re + bins); r->out.insert(r->out.end(), im, im + bins);
+}
 // 跑 aec48（可挂频谱档），返回挪回 mic 时间轴的输出
-static std::vector<float> runChain(const std::vector<float>& mic, const std::vector<float>& ref, int sr, Ans48* n, float g, Tog tog, int togBlocks) {
+static std::vector<float> runChain(const std::vector<float>& mic, const std::vector<float>& ref, int sr, Ans48* n, float g, Tog tog, int togBlocks, int* applied = nullptr, Rec* rec = nullptr) {
     const int B = 384; Aec48* a = aec48_create(sr, B); if (!a) { fprintf(stderr, "aec48_create 失败\n"); exit(2); }
     const int lat = aec48_latency_samples(a);
-    if (n) { ans48_reset(n); ans48_set_strength(n, g); aec48_set_spec_hook(a, ans48_spec_frame, n); }
+    if (n) { ans48_reset(n); ans48_set_strength(n, g);
+        if (rec) { rec->n = n; rec->in.clear(); rec->out.clear(); rec->g.clear(); aec48_set_spec_hook(a, recHook, rec); } else aec48_set_spec_hook(a, ans48_spec_frame, n); }
     std::vector<float> y; y.reserve(mic.size() + B); std::vector<float> out(B);
     for (size_t i = 0, k = 0; i + B <= mic.size(); i += B, ++k) {
         if (tog != NONE && k > 0 && k % togBlocks == 0) {
             const bool on = (k / togBlocks) % 2 == 0;
             if (tog == GAIN) ans48_set_strength(n, on ? g : 0.f); else aec48_set_spec_hook_enabled(a, on ? 1 : 0);
+            if (applied) ++*applied;   // 实际执行的切换，在执行时计数（10-13 挑战式审查：分析口径的计数会漏掉末尾的切换）
         }
         aec48_process(a, &mic[i], &ref[i], out.data(), B); y.insert(y.end(), out.begin(), out.end());
     }
@@ -58,10 +70,23 @@ int main(int argc, char** argv) {
     const int togBlocks = (int)(2.0 * sr / 384);   // 每 2 s 切一次
 
     const auto A = runChain(mic, ref, sr, nullptr, 1.f, NONE, 0);
-    const auto B1 = runChain(mic, ref, sr, n, 1.f, NONE, 0);
+    Rec recB, recF, recG;
+    const auto B1 = runChain(mic, ref, sr, n, 1.f, NONE, 0, nullptr, &recB);
     const auto C2 = runChain(mic, ref, sr, n, 2.f, NONE, 0);
-    const auto F = runChain(mic, ref, sr, n, 1.f, GAIN, togBlocks);
-    const auto G = runChain(mic, ref, sr, n, 1.f, HOOK, togBlocks);
+    int appliedF = 0, appliedG = 0;
+    const auto F = runChain(mic, ref, sr, n, 1.f, GAIN, togBlocks, &appliedF, &recF);
+    const auto G = runChain(mic, ref, sr, n, 1.f, HOOK, togBlocks, &appliedG, &recG);
+    // 帧级核对
+    const int BN = nfft / 2 + 1; const size_t nfB = recB.g.size(), nfF = recF.g.size(), nfG = recG.g.size();
+    long frOn = 0, frOff = 0, frBad = 0;
+    for (size_t c = 0; c < std::min(nfB, nfF); ++c) {
+        const float* fo = &recF.out[c * 2 * BN]; const float* fi = &recF.in[c * 2 * BN]; const float* bo = &recB.out[c * 2 * BN]; const float* bi = &recB.in[c * 2 * BN];
+        const bool inSame = !memcmp(fi, bi, 2 * BN * 4);   // 两次跑进来的频谱应相同（aec48 不受回调输出影响）
+        if (recF.g[c] == 1.f) { ++frOn; if (!inSame || memcmp(fo, bo, 2 * BN * 4)) ++frBad; }
+        else { ++frOff; if (memcmp(fo, fi, 2 * BN * 4)) ++frBad; }
+    }
+    // 挂钩开关：关着时回调不被调用——G 的帧数应 = 开着的块数；开着的帧进来的频谱与 B 同一时刻的相同
+    const long expectG = [&] { long k = 0; const size_t nb = mic.size() / 384; for (size_t b = 1; b < nb; ++b) { if (((b / togBlocks) % 2) == 0) ++k; } return k; }();
     std::vector<float> D1, E2;
     for (float g : {1.f, 2.f}) {   // 旧接法：aec48 输出（波形）→ 推流档
         Ans48* s = ans48_create(sr, ANS48_MODE_STREAM); ans48_set_strength(s, g); const int L = ans48_latency_samples(s);
@@ -71,43 +96,53 @@ int main(int argc, char** argv) {
     wr(od + "/A_aec.pcm", A); wr(od + "/B_spec_g1.pcm", B1); wr(od + "/C_spec_g2.pcm", C2); wr(od + "/D_serial_g1.pcm", D1);
     wr(od + "/E_serial_g2.pcm", E2); wr(od + "/F_tog_gain.pcm", F); wr(od + "/G_tog_hook.pcm", G);
 
-    // 切换分析：第 j 段（每段 togBlocks 块）开 = j 偶数。切换点 = 段边界（mic 时间轴，aec 延迟已挪掉；
-    // 帧窗跨 1536 样本，故边界前后各 1536 样本算过渡带）
-    const size_t seg = (size_t)togBlocks * 384, L = std::min({A.size(), B1.size(), F.size(), G.size()});
-    auto devDb = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, size_t b) {
-        double e = 0, s = 0; for (size_t i = a; i < b && i < L; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } return 10 * log10(e / (s + 1e-20) + 1e-20); };
-    double fSteady = -300, gSteady = -300, fJump = 0, gJump = 0, settleMax = 0; int nsw = 0, nReopen = 0, nUnsettled = 0;
-    // 遍历每个实际发生的切换（最后一段不满 2 s 也算，只要切换点之后还有一个过渡带的样本）——10-13 Codex 审查指出原写法漏掉末次切换
-    // 「后面还有没有切换」按实际处理过的输入长度判断，不按挪掉 aec 延迟后的输出长度 L：切换落在输入末尾几块里时已经生效，
-    // 但它的输出过渡带被延迟截在 L 之外（10-13 Codex 复审指出）
-    const size_t P = mic.size() / 384 * 384;
-    for (size_t j = 1; j * seg < P && j * seg + 1536 < L; ++j) {
+    // ---- 切换分析（10-13 挑战式审查后重写）----
+    // 第 j 段（每段 togBlocks 块）开 = j 偶数；切换点 s0 = j·seg（mic 时间轴，aec 延迟已挪掉）。帧窗 1536 样本：
+    // 切换后算出的第一帧覆盖切换点之前约 1000 个样本，所以过渡带取 [s0 − 1536, s0 + 1536)，稳态取过渡带之后到下一过渡带之前。
+    //   逐样本相同：稳态区间里按浮点位逐个比（不是能量比），报比较样本数、不相等样本数、最大绝对误差；
+    //   切换本身有没有引入异常：在帧上核（见 main 开头的帧级核对），输出波形上的过渡是 aec48 合成时的重叠相加。
+    //   （曾试过「过渡带输出应落在开 / 关两路之间」的逐样本指标：重叠相加时每个样本由几帧叠成，正常过渡也不必落在两路之间，
+    //     分不清毛刺与正常过渡，已删，10-13。）
+    //   挂钩重开的收敛：块级（384 样本）误差能量相对 B 的同块能量 < −40 dB、并持续 ≥ 0.5 s 才算收敛；B 那块低于 −70 dBFS 的近静音块不参与判定。
+    const size_t seg = (size_t)togBlocks * 384, L = std::min({A.size(), B1.size(), F.size(), G.size()}), P = mic.size() / 384 * 384;
+    const double sil = pow(10.0, -70 / 10.0) * 384;   // 近静音块的能量门槛（−70 dBFS）
+    auto blkE = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, double* er) { double e = 0, s = 0; for (size_t i = a; i < a + 384; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } *er = e; return s; };
+    long cmpN = 0, neqF = 0, neqG = 0; double maxF = 0, maxG = 0, settleMax = 0;
+    int analyzed = 0, ro = 0, roConv = 0, roUnconv = 0, roShort = 0, roSilent = 0;
+    for (size_t j = 1; j * seg < P; ++j) {
+        const size_t s0 = j * seg; if (s0 + 1536 >= L) break;           // 输出里看不到这次切换之后的样本（被 aec 延迟截掉）：不分析，计数里已含
+        ++analyzed;
         const bool on = j % 2 == 0; const std::vector<float>& ref_ = on ? B1 : A;
-        const size_t s0 = j * seg; const bool nextSw = (j + 1) * seg < P; const size_t s1 = std::min((j + 1) * seg, L);
-        // 稳态：过渡带之后到段末。下一次切换后算出的第一帧，窗口覆盖切换点之前约 1000 个样本，所以有下一次切换时段尾要让开 1536 个样本
-        // （10-13 实测：差异全在段尾这一截）；后面确实没有切换才不用让
-        const size_t e1 = nextSw ? std::min((j + 1) * seg - 1536, L) : L;
-        if (e1 > s0 + 1536 + 384) {
-            fSteady = std::max(fSteady, devDb(F, ref_, s0 + 1536, e1));
-            if (!on) gSteady = std::max(gSteady, devDb(G, A, s0 + 1536, e1));
+        const bool nextSw = (j + 1) * seg < P; const size_t e1 = nextSw ? std::min((j + 1) * seg - 1536, L) : L;
+        // 稳态逐样本（浮点位）比
+        if (e1 > s0 + 1536) for (size_t i = s0 + 1536; i < e1; ++i) {
+            ++cmpN;
+            if (memcmp(&F[i], &ref_[i], 4)) { ++neqF; maxF = std::max(maxF, (double)fabsf(F[i] - ref_[i])); }
+            if (!on && memcmp(&G[i], &A[i], 4)) { ++neqG; maxG = std::max(maxG, (double)fabsf(G[i] - A[i])); }
         }
-        // 突变：过渡带内相邻样本差的最大值 / 该处信号峰值（对比同位置参照自身的相邻差）
-        auto jump = [&](const std::vector<float>& x) { double mx = 0, mr = 1e-9; for (size_t i = (s0 > 1536 ? s0 - 1536 : 1); i < s0 + 1536 && i < L; ++i) {
-            mx = std::max(mx, (double)fabsf(x[i] - x[i - 1])); mr = std::max(mr, (double)std::max(fabsf(A[i] - A[i - 1]), fabsf(B1[i] - B1[i - 1]))); } return 20 * log10(mx / mr); };
-        fJump = std::max(fJump, jump(F)); gJump = std::max(gJump, jump(G));
-        if (on && e1 >= s0 + 1536 + (size_t)(0.5 * sr)) {
-            // G 重新打开后的收敛：最早的 t，使 [t, 稳态末) 每个 384 样本块都低于 −40 dB，且这一段至少 0.5 s；
-            // 找不到就记为未收敛（不再把观察窗口的终点当作收敛时刻——10-13 Codex 审查指出）
-            ++nReopen; size_t t = e1; const size_t minHold = (size_t)(0.5 * sr);
-            for (size_t u = e1; u >= s0 + 1536 + 384; u -= 384) { if (devDb(G, B1, u - 384, u) > -40) break; t = u - 384; }
-            if (e1 - t >= minHold) settleMax = std::max(settleMax, (double)(t - s0) / sr); else ++nUnsettled;
+        // 挂钩重开的收敛
+        if (on) {
+            ++ro; const size_t hold = (size_t)(0.5 * sr);
+            if (e1 < s0 + 1536 + hold) { ++roShort; continue; }
+            size_t t = e1 - (e1 - s0 - 1536) % 384; bool anyLoud = false; size_t conv = t;   // 从段尾往前找最长的「全部达标」尾段
+            for (size_t u = t; u >= s0 + 1536 + 384; u -= 384) {
+                double er; const double sr_ = blkE(G, B1, u - 384, &er);
+                if (sr_ < sil) { conv = u - 384; continue; }          // 近静音块：不参与判定
+                anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) break; conv = u - 384;
+            }
+            if (!anyLoud) { ++roSilent; continue; }
+            if (t - conv >= hold) { ++roConv; settleMax = std::max(settleMax, (double)(conv - s0) / sr); } else ++roUnconv;
         }
-        ++nsw;
     }
     bool fin = true; for (const std::vector<float>* v : std::initializer_list<const std::vector<float>*>{&A, &B1, &C2, &D1, &E2, &F, &G}) for (float x : *v) if (!std::isfinite(x)) fin = false;
     printf("{\"samples\":%zu,\"finite\":%s,\"mic_db\":%.2f,\"A_db\":%.2f,\"B_db\":%.2f,\"C_db\":%.2f,\"D_db\":%.2f,\"E_db\":%.2f,"
-           "\"switches\":%d,\"F_steady_vs_ref_db\":%.1f,\"G_off_vs_A_db\":%.1f,\"F_jump_db\":%.2f,\"G_jump_db\":%.2f,\"G_reopen\":%d,\"G_unsettled\":%d,\"G_settle_max_s\":%.3f}\n",
+           "\"switches_applied_F\":%d,\"switches_applied_G\":%d,\"switches_analyzed\":%d,"
+           "\"steady_cmp\":%ld,\"steady_neq_F\":%ld,\"steady_maxabs_F\":%.3g,\"steady_neq_G_off\":%ld,\"steady_maxabs_G_off\":%.3g,"
+           
+           "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"settle_max_s\":%.3f,"
+           "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld}\n",
            L, fin ? "true" : "false", rmsDb(mic, 0, L), rmsDb(A, 0, L), rmsDb(B1, 0, L), rmsDb(C2, 0, L), rmsDb(D1, 0, std::min(L, D1.size())), rmsDb(E2, 0, std::min(L, E2.size())),
-           nsw, fSteady, gSteady, fJump, gJump, nReopen, nUnsettled, settleMax);
+           appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, settleMax,
+           nfB, nfF, frOn, frOff, frBad, nfG, expectG);
     ans48_destroy(n); return 0;
 }
