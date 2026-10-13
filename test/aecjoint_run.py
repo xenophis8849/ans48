@@ -9,7 +9,10 @@
   切换 / 帧 / 样本计数：各条相加。
   挂钩重开后的误差：ans48_aecjoint 对每次重开、每个时间窗（从过渡带之后算起 0–0.1 / 0.1–0.3 / 0.3–0.6 / 0.6–1.0 / 1.0–1.5 s），
     在浮点域累加「与一直挂着的误差能量」和「一直挂着那路的能量」（一直挂着那块低于 −70 dBFS 的近静音块两项都不计），取两者之比（dB）；
-    窗内没有可听块或窗超出观察区间记为空。这里对全部条、全部重开的同一时间窗取中位数、90% 分位与最大值，空值不计。
+    窗内没有可听块或窗超出观察区间记为空。每次重开都出一行（含观察不足的），这里对全部条、全部重开的同一时间窗取中位数、
+    90% 分位与最大值，空值不计。观察窗止于下一次关（每 2 s 切一次），所以 1.5 s 以后的情况本测试不覆盖。
+  电平：各路在同一区间上比（取各路共同长度）。
+  任一条联调程序失败：打印失败条目并以非零状态退出（汇总不完整）。
 """
 import os, sys, json, glob, subprocess
 import numpy as np
@@ -38,7 +41,7 @@ def main():
     items = [("双讲", f"{bs}/doubletalk/{n}_mic.wav") for n in DT]
     items += [("远端单讲", p) for p in sorted(glob.glob(f"{bs}/farend-singletalk/*_mic.wav"))[:6]]
     items += [("近端单讲", p) for p in sorted(glob.glob(f"{bs}/nearend-singletalk/*_mic.wav"))[:6]]
-    rows = []
+    rows, fails = [], []
     for kind, mic in items:
         name = os.path.basename(mic)[:-len("_mic.wav")]; d = os.path.join(out, name); os.makedirs(d, exist_ok=True)
         for src, dst in ((mic, "mic.pcm"), (mic.replace("_mic.wav", "_lpb.wav"), "ref.pcm")):
@@ -47,13 +50,15 @@ def main():
         r = subprocess.run([exe, f"{d}/mic.pcm", f"{d}/ref.pcm", "48000", d], capture_output=True, text=True,
                            env=dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(os.path.abspath(exe))))
         if r.returncode != 0:
-            print("失败", name, r.stderr[-300:], flush=True); continue
+            print("失败", name, r.stderr[-300:], flush=True); fails.append(name); continue
         j = json.loads(r.stdout.strip().splitlines()[-1]); j.update(kind=kind, name=name); rows.append(j)
         print(kind, name, flush=True)
     with open(os.path.join(out, "joint.jsonl"), "w") as f:
         for j in rows:
             f.write(json.dumps(j, ensure_ascii=False) + "\n")
     summarize(rows)
+    if fails or len(rows) != len(items):   # 有条失败：汇总不完整，退出码非零（10-13 Codex 审查）
+        print(f"汇总不完整：{len(items)} 条里失败 {len(fails)} 条：{fails}", flush=True); sys.exit(1)
 
 
 def summarize(r):

@@ -142,17 +142,8 @@ int main(int argc, char** argv) {
         // 挂钩重开的收敛
         if (on) {
             ++ro; const size_t hold = (size_t)(0.5 * sr);
-            if (e1 < s0 + 1536 + hold) { ++roShort; continue; }
-            // 从段尾往前找最长的「可听块全部达标」尾段。近静音块不参与判定，也不算进持续时长——持续时长只累计可听且达标的块
-            // （10-13 Codex 审查：原写法把近静音尾段算进 0.5 s，一个可听块都没达标也能报收敛）
-            size_t t = e1 - (e1 - s0 - 1536) % 384; bool anyLoud = false, failed = false; size_t conv = t, loudPass = 0;
-            for (size_t u = t; u >= s0 + 1536 + 384; u -= 384) {
-                double er; const double sr_ = blkE(G, B1, u - 384, &er);
-                if (sr_ < sil) { conv = u - 384; continue; }          // 近静音块
-                anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) { failed = true; break; }
-                conv = u - 384; loudPass += 384;
-            }
-            // 按时间窗记误差（浮点域；每窗累加非近静音块的误差能量与 B 能量，窗内没有可听块就记 NaN）。窗从过渡带之后算起。
+            // 按时间窗记误差（浮点域；每窗累加非近静音块的误差能量与 B 能量；窗内没有可听块、或窗超出观察区间就记 null）。窗从过渡带之后算起。
+            // 放在「观察不足」的提前退出之前：观察不到 0.5 s 的重开，已完整看到的前几个窗也要计入（10-13 Codex 审查）
             {
                 static const double W[6] = {0.0, 0.1, 0.3, 0.6, 1.0, 1.5}; std::string row = "[";
                 for (int w = 0; w < 5; ++w) {
@@ -163,21 +154,33 @@ int main(int argc, char** argv) {
                 }
                 winRows += (winRows.empty() ? "" : ",") + row + "]";
             }
+            if (e1 < s0 + 1536 + hold) { ++roShort; continue; }
+            // 从段尾往前找最长的「可听块全部达标」尾段。近静音块不参与判定，也不算进持续时长——持续时长只累计可听且达标的块
+            // （10-13 Codex 审查：原写法把近静音尾段算进 0.5 s，一个可听块都没达标也能报收敛）
+            size_t t = e1 - (e1 - s0 - 1536) % 384; bool anyLoud = false, failed = false; size_t conv = t, loudPass = 0;
+            for (size_t u = t; u >= s0 + 1536 + 384; u -= 384) {
+                double er; const double sr_ = blkE(G, B1, u - 384, &er);
+                if (sr_ < sil) { conv = u - 384; continue; }          // 近静音块
+                anyLoud = true; if (10 * log10(er / sr_ + 1e-30) > -40) { failed = true; break; }
+                conv = u - 384; loudPass += 384;
+            }
             if (!anyLoud) ++roSilent;
             else if (loudPass >= hold) { ++roConv; settleMax = std::max(settleMax, (double)(conv - s0) / sr); }
             else if (failed) ++roUnconv;
             else ++roThin;                                             // 可听块全都达标，但合计不到 0.5 s：证据不足
         }
     }
+    // 各路电平在同一区间上比（旧接法扣掉 1024 样本延迟后尾部短一截；10-13 挑战式审查：区间不同会把内容差混进接法差）
+    const size_t Lc = std::min({L, C2.size(), D1.size(), E2.size()});
     bool fin = true; for (const std::vector<float>* v : std::initializer_list<const std::vector<float>*>{&A, &B1, &C2, &D1, &E2, &F, &G}) for (float x : *v) if (!std::isfinite(x)) fin = false;
-    printf("{\"samples\":%zu,\"finite\":%s,\"mic_db\":%.2f,\"A_db\":%.2f,\"B_db\":%.2f,\"C_db\":%.2f,\"D_db\":%.2f,\"E_db\":%.2f,"
+    printf("{\"samples\":%zu,\"level_samples\":%zu,\"finite\":%s,\"mic_db\":%.2f,\"A_db\":%.2f,\"B_db\":%.2f,\"C_db\":%.2f,\"D_db\":%.2f,\"E_db\":%.2f,"
            "\"switches_applied_F\":%d,\"switches_applied_G\":%d,\"switches_analyzed\":%d,"
            "\"steady_cmp\":%ld,\"steady_neq_F\":%ld,\"steady_maxabs_F\":%.3g,\"steady_neq_G_off\":%ld,\"steady_maxabs_G_off\":%.3g,"
            
            "\"reopen\":%d,\"reopen_converged\":%d,\"reopen_unconverged\":%d,\"reopen_short\":%d,\"reopen_silent\":%d,\"reopen_thin\":%d,\"settle_max_s\":%.3f,"
            "\"frames_B\":%zu,\"frames_F\":%zu,\"frames_F_on\":%ld,\"frames_F_off\":%ld,\"frames_F_bad\":%ld,\"frames_G\":%zu,\"frames_G_expect\":%ld,"
            "\"G_missing\":%ld,\"G_extra\":%ld,\"G_dup\":%ld,\"G_in_neq_B\":%ld,\"reopen_win_db\":[%s]}\n",
-           L, fin ? "true" : "false", rmsDb(mic, 0, L), rmsDb(A, 0, L), rmsDb(B1, 0, L), rmsDb(C2, 0, L), rmsDb(D1, 0, std::min(L, D1.size())), rmsDb(E2, 0, std::min(L, E2.size())),
+           L, Lc, fin ? "true" : "false", rmsDb(mic, 0, Lc), rmsDb(A, 0, Lc), rmsDb(B1, 0, Lc), rmsDb(C2, 0, Lc), rmsDb(D1, 0, Lc), rmsDb(E2, 0, Lc),
            appliedF, appliedG, analyzed, cmpN, neqF, maxF, neqG, maxG, ro, roConv, roUnconv, roShort, roSilent, roThin, settleMax,
            nfB, nfF, frOn, frOff, frBad, nfG, expectG, gMissing, gExtra, gDup, gInNeq, winRows.c_str());
     ans48_destroy(n); return 0;
