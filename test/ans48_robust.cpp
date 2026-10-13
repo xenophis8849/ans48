@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
         Ans48* a = ans48_create(c.sr, c.mode); const int L = ans48_latency_samples(a); const float mx = ans48_max_strength(a); const float g0 = ans48_get_strength(a); ans48_destroy(a);
         const int want = c.mode == ANS48_MODE_MONITOR ? 256 : 1024;
         check(L == want && mx == 2.f   /* 0.3.0 起两档上限都是 2（推流档原为 1） */, nm + "：延迟 = 窗长、强度上限符合档位", "延迟 " + std::to_string(L) + "，上限 " + std::to_string(mx));
-        check(g0 == 1.f, nm + "：不设强度时默认 1", "默认 " + std::to_string(g0));   // 10-14 需求方：落端方不指定时三档默认强度都是 1
+        check(g0 == 1.f, nm + "：不设强度时默认 1", "默认 " + std::to_string(g0));   // 不指定强度时三档默认都是 1
 
         // 延迟实测：强度 0 时输出 = 输入挪后 L 个样本
         { auto o = run(x, c.sr, c.mode, 480, 0.f); double d = 0; for (size_t i = 0; i + L < x.size(); ++i) d = std::max(d, (double)std::fabs(o[i + L] - x[i]));
