@@ -62,7 +62,34 @@ static std::vector<float> runChain(const std::vector<float>& mic, const std::vec
     std::vector<float> z(y.begin() + std::min<size_t>(lat, y.size()), y.end()); return z;
 }
 
+// 一次重开的分时间窗误差（浮点域）：窗从 g0（过渡带之后）起算 0–0.1 / 0.1–0.3 / 0.3–0.6 / 0.6–1.0 / 1.0–1.5 s，每个窗按自己的起止样本
+// 逐样本累加「G 与 B 的误差能量」和「B 的能量」，取比值（dB）。静音判定按从 g0 起的连续 384 样本块网格：块里 B 的能量低于 sil
+// （−70 dBFS）则该块的样本都不计。窗超出观察末 e1、或窗里没有可听样本，记 null。
+// （10-13 挑战式审查：原写法只累加窗内完整的块，有的窗会丢掉末尾 192 样本；`--selftest` 用窗尾误差构造验证）
+static std::string winRow(const std::vector<float>& G, const std::vector<float>& B, size_t g0, size_t e1, size_t L, int sr, double sil) {
+    static const double W[6] = {0.0, 0.1, 0.3, 0.6, 1.0, 1.5}; std::string row = "[";
+    std::vector<signed char> loud;
+    auto isLoud = [&](size_t i) { const size_t b = (i - g0) / 384; if (b >= loud.size()) loud.resize(b + 1, -1);
+        if (loud[b] < 0) { double e = 0; const size_t u = g0 + b * 384; for (size_t q = u; q < u + 384 && q < L; ++q) e += (double)B[q] * B[q]; loud[b] = e >= sil; }
+        return loud[b] > 0; };
+    for (int w = 0; w < 5; ++w) {
+        const size_t x0 = g0 + (size_t)(W[w] * sr), x1 = g0 + (size_t)(W[w + 1] * sr); double E = 0, S = 0;
+        if (x1 <= e1) for (size_t i = x0; i < x1; ++i) { if (!isLoud(i)) continue; const double d = (double)G[i] - B[i]; E += d * d; S += (double)B[i] * B[i]; }
+        char b[32]; if (x1 <= e1 && S > 0) snprintf(b, sizeof b, "%.2f", 10 * log10(E / S + 1e-30)); else snprintf(b, sizeof b, "null");
+        row += (w ? "," : ""); row += b;
+    }
+    return row + "]";
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1], "--selftest")) {   // 窗尾误差：B 恒为 1，G 只在 0–0.1 s 窗的最后 192 样本为 2 → 应为 10·log10(192/4800) ≈ −14 dB
+        const int sr = 48000; const size_t g0 = 1000, n = g0 + 2 * sr; std::vector<float> B(n, 1.f), G(n, 1.f);
+        for (size_t i = g0 + 4800 - 192; i < g0 + 4800; ++i) G[i] = 2.f;
+        const std::string r = winRow(G, B, g0, n, n, sr, 1e-9);
+        const double v = atof(r.c_str() + 1), want = 10 * log10(192.0 / 4800);
+        printf("窗尾误差自检：%s（第一窗应 %.2f dB）→ %s\n", r.c_str(), want, fabs(v - want) < 0.05 ? "通过" : "不通过");
+        return fabs(v - want) < 0.05 ? 0 : 1;
+    }
     if (argc < 5) { fprintf(stderr, "用法：%s mic.pcm ref.pcm 采样率 输出目录\n", argv[0]); return 2; }
     std::vector<float> mic = rd(argv[1]), ref = rd(argv[2]); const int sr = atoi(argv[3]); const std::string od = argv[4];
     const size_t n0 = std::min(mic.size(), ref.size()); mic.resize(n0); ref.resize(n0);   // 两路截到等长（盲测集个别条长度差几个样本）
@@ -157,14 +184,7 @@ int main(int argc, char** argv) {
             // 按时间窗记误差（浮点域；每窗累加非近静音块的误差能量与 B 能量；窗内没有可听块、或窗超出观察区间就记 null）。窗从过渡带之后算起。
             // 放在「观察不足」的提前退出之前：观察不到 0.5 s 的重开，已完整看到的前几个窗也要计入（10-13 Codex 审查）
             {
-                static const double W[6] = {0.0, 0.1, 0.3, 0.6, 1.0, 1.5}; std::string row = "[";
-                for (int w = 0; w < 5; ++w) {
-                    const size_t x0 = s0 + 1536 + (size_t)(W[w] * sr), x1 = s0 + 1536 + (size_t)(W[w + 1] * sr); double E = 0, S2 = 0;
-                    if (x1 <= e1) for (size_t u = x0; u + 384 <= x1; u += 384) { double er; const double sr_ = blkE(G, B1, u, &er); if (sr_ < sil) continue; E += er; S2 += sr_; }
-                    char b[32]; if (x1 <= e1 && S2 > 0) snprintf(b, sizeof b, "%.2f", 10 * log10(E / S2 + 1e-30)); else snprintf(b, sizeof b, "null");
-                    row += (w ? "," : ""); row += b;
-                }
-                winRows += (winRows.empty() ? "" : ",") + row + "]";
+                winRows += (winRows.empty() ? "" : ",") + winRow(G, B1, s0 + 1536, e1, L, sr, sil);
             }
             if (e1 < s0 + 1536 + hold) { ++roShort; continue; }
             // 从段尾往前找最长的「可听块全部达标」尾段。近静音块不参与判定，也不算进持续时长——持续时长只累计可听且达标的块
