@@ -26,7 +26,7 @@
 | `models/` | 权重原件（`kernel_weights.bin` + `kernel_manifest.json`），`tools/embed_models.py` 把它们编进 `src/models.cpp` |
 | `prebuilt/arm64-v8a/libans48.so`、`prebuilt/armeabi-v7a/libans48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
 | `test/ans48_check.cpp`、`test/ans48_robust.cpp`、`test/ans48_wrap.cpp`、`test/ans48_oom.cpp`、`test/ans48_bench.cpp`、`test/vec/` | 自检、接口健壮性测试、计数器回绕测试、内存分配失败注入（Linux 主机）、端上测速、测试向量 |
-| `test/ans48_speccheck.cpp`、`test/ans48_aecchain.cpp` | 频谱档自检（按联动契约自做分析 / 合成，对参照）、与 aec48 串联核对（只在 `-DANS48_AEC48_DIR=<aec48 目录>` 时编） |
+| `test/ans48_speccheck.cpp`、`test/ans48_aecchain.cpp`、`test/ans48_aecjoint.cpp` | 频谱档自检（按联动契约自做分析 / 合成，对参照）；与 aec48 串联核对、联调（后两个只在 `-DANS48_AEC48_DIR=<aec48 目录>` 时编） |
 | `tools/build_android.sh` | 编两个 ABI 的库与手机上跑的测试程序 |
 
 ---
@@ -142,6 +142,24 @@ ans48_destroy(n);
 
 - `ans48_speccheck <向量目录> 00d2fda6`：按契约自做分析 / 合成（左补 768 个零后因果分帧、周期 sqrt-Hann、不归一化 DFT；合成时 IDFT/N 乘窗、重叠相加、除以窗平方的重叠和），逐帧调用 `ans48_spec_frame`，与参照波形逐样本比。另查参数核对、γ = 0 恒等、复位后与新实例相同。
 - `ans48_aecchain <向量目录> 00d2fda6`：链接 aec48 的主机构建。aec48 直通时挂上频谱档，输出应等于参照再晚 `aec48_latency_samples` 个样本；aec48 开、强度 0 时，输出应与不挂回调逐样本相同；同时报每块耗时。
+
+### 联调结果（ans48 0.3.0 × aec48 0.5.2，主机）
+
+`test/ans48_aecjoint`（只在 `-DANS48_AEC48_DIR=<aec48 目录>` 时编）在带回声的录音上把两个库串起来跑，写出各种接法的输出，并量切换处的突变。素材是公开的 ICASSP 2023 AEC Challenge 盲测集（48 kHz），共 25 条：双讲 13 条、远端单讲 6 条、近端单讲 6 条。
+
+```sh
+ans48_aecjoint <mic.pcm> <ref.pcm> 48000 <输出目录>
+```
+
+| 项目 | 结果 |
+|---|---|
+| 输出 | 25 条每条每种接法都是有限数，没有异常 |
+| 残余回声 | 远端单讲（只有回声）挂上频谱档后，输出比 aec48 单独时更低（γ1 约 −0.6 ~ −2.4 dB），没有被放大 |
+| 电平 | 频谱档 γ1 比 aec48 单独整体低约 0.7 dB、γ2 约 1.4 dB；与旧接法（aec48 输出合成后再串推流档）基本相同，但旧接法多 1024 样本延迟 |
+| 用强度 0 临时关（每 2 s 在 1 ↔ 0 之间切） | 每段稳态与参照逐样本相同：开的段等于一直挂着，关的段等于 aec48 单独；切换处没有突变 |
+| 用 aec48 挂钩开关临时关（每 2 s 关 / 开） | 关的段与 aec48 单独逐样本相同，切换处没有突变。重新打开后，本库带着关之前的跨帧记忆，与一直开着的偏差（中位）：0–0.1 s −35 dB，0.3–0.6 s −42 dB，1.5–1.9 s −45 dB，约为降噪改动量本身的 −21 ~ −27 dB。影响小，但会持续 1–2 s，所以临时关降噪优先用强度 0 |
+
+测切换时注意：切换后算出的第一帧，窗口（1536 样本）会覆盖切换点之前约 1000 个样本，比较稳态时段首、段尾都要让开一个窗长。
 
 ### 契约变更记录
 
