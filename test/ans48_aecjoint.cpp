@@ -8,7 +8,7 @@
 //   F_tog_gain  频谱档 γ1，每 2 s 在强度 1 ↔ 0 之间切（推荐的临时关法）
 //   G_tog_hook  频谱档 γ1，每 2 s 用 aec48 的挂钩开关关 / 开（关的那段 ans48 收不到帧）
 // 标准输出一行 JSON：各路电平；F / G 对「分段参照」（开的段取 B、关的段取 A）在每个切换点之后的偏差，
-// 以及 G 重新打开后多久才回到与 B 相差 < −40 dB（旧记忆的影响时长）。
+// 以及 G 重新打开后多久才持续回到与 B 相差 < −40 dB（旧记忆的影响时长；持续 0.5 s 以上才算，观察窗内没做到的计为未收敛）。
 #include "aec48.h"
 #include "ans48.h"
 #include <algorithm>
@@ -76,28 +76,35 @@ int main(int argc, char** argv) {
     const size_t seg = (size_t)togBlocks * 384, L = std::min({A.size(), B1.size(), F.size(), G.size()});
     auto devDb = [&](const std::vector<float>& x, const std::vector<float>& r, size_t a, size_t b) {
         double e = 0, s = 0; for (size_t i = a; i < b && i < L; ++i) { e += (double)(x[i] - r[i]) * (x[i] - r[i]); s += (double)r[i] * r[i]; } return 10 * log10(e / (s + 1e-20) + 1e-20); };
-    double fSteady = -300, gSteady = -300, fJump = 0, gJump = 0, settleMax = 0; int nsw = 0;
-    for (size_t j = 1; (j + 1) * seg <= L; ++j) {
+    double fSteady = -300, gSteady = -300, fJump = 0, gJump = 0, settleMax = 0; int nsw = 0, nReopen = 0, nUnsettled = 0;
+    // 遍历每个实际发生的切换（最后一段不满 2 s 也算，只要切换点之后还有一个过渡带的样本）——10-13 Codex 审查指出原写法漏掉末次切换
+    for (size_t j = 1; j * seg + 1536 < L; ++j) {
         const bool on = j % 2 == 0; const std::vector<float>& ref_ = on ? B1 : A;
-        const size_t s0 = j * seg, s1 = (j + 1) * seg;
-        // 稳态（过渡带之后到段末）：F 应与参照逐样本相同或极近；G 关的段应等于 A，开的段要等旧记忆消退
-        // 下一次切换后算出的第一帧，窗口覆盖切换点之前约 1000 个样本，所以段尾也要让开 1536 个样本（10-13 实测：差异全在段尾这一截）
-        fSteady = std::max(fSteady, devDb(F, ref_, s0 + 1536, s1 - 1536));
-        if (!on) gSteady = std::max(gSteady, devDb(G, A, s0 + 1536, s1 - 1536));
+        const size_t s0 = j * seg; const bool last = (j + 1) * seg >= L; const size_t s1 = last ? L : (j + 1) * seg;
+        // 稳态：过渡带之后到段末。下一次切换后算出的第一帧，窗口覆盖切换点之前约 1000 个样本，所以段尾也要让开 1536 个样本
+        // （10-13 实测：差异全在段尾这一截）；最后一段后面没有切换，不用让
+        const size_t e1 = last ? s1 : s1 - 1536;
+        if (e1 > s0 + 1536 + 384) {
+            fSteady = std::max(fSteady, devDb(F, ref_, s0 + 1536, e1));
+            if (!on) gSteady = std::max(gSteady, devDb(G, A, s0 + 1536, e1));
+        }
         // 突变：过渡带内相邻样本差的最大值 / 该处信号峰值（对比同位置参照自身的相邻差）
         auto jump = [&](const std::vector<float>& x) { double mx = 0, mr = 1e-9; for (size_t i = (s0 > 1536 ? s0 - 1536 : 1); i < s0 + 1536 && i < L; ++i) {
             mx = std::max(mx, (double)fabsf(x[i] - x[i - 1])); mr = std::max(mr, (double)std::max(fabsf(A[i] - A[i - 1]), fabsf(B1[i] - B1[i - 1]))); } return 20 * log10(mx / mr); };
         fJump = std::max(fJump, jump(F)); gJump = std::max(gJump, jump(G));
-        if (on) {   // G 重新打开：多久回到与 B 相差 < −40 dB（按 384 样本一段量）
-            size_t t = s0 + 1536; while (t + 384 <= s1 - 1536 && devDb(G, B1, t, t + 384) > -40) t += 384;
-            settleMax = std::max(settleMax, (double)(t - s0) / sr);
+        if (on && e1 >= s0 + 1536 + (size_t)(0.5 * sr)) {
+            // G 重新打开后的收敛：最早的 t，使 [t, 稳态末) 每个 384 样本块都低于 −40 dB，且这一段至少 0.5 s；
+            // 找不到就记为未收敛（不再把观察窗口的终点当作收敛时刻——10-13 Codex 审查指出）
+            ++nReopen; size_t t = e1; const size_t minHold = (size_t)(0.5 * sr);
+            for (size_t u = e1; u >= s0 + 1536 + 384; u -= 384) { if (devDb(G, B1, u - 384, u) > -40) break; t = u - 384; }
+            if (e1 - t >= minHold) settleMax = std::max(settleMax, (double)(t - s0) / sr); else ++nUnsettled;
         }
         ++nsw;
     }
     bool fin = true; for (const std::vector<float>* v : std::initializer_list<const std::vector<float>*>{&A, &B1, &C2, &D1, &E2, &F, &G}) for (float x : *v) if (!std::isfinite(x)) fin = false;
     printf("{\"samples\":%zu,\"finite\":%s,\"mic_db\":%.2f,\"A_db\":%.2f,\"B_db\":%.2f,\"C_db\":%.2f,\"D_db\":%.2f,\"E_db\":%.2f,"
-           "\"switches\":%d,\"F_steady_vs_ref_db\":%.1f,\"G_off_vs_A_db\":%.1f,\"F_jump_db\":%.2f,\"G_jump_db\":%.2f,\"G_settle_s\":%.3f}\n",
+           "\"switches\":%d,\"F_steady_vs_ref_db\":%.1f,\"G_off_vs_A_db\":%.1f,\"F_jump_db\":%.2f,\"G_jump_db\":%.2f,\"G_reopen\":%d,\"G_unsettled\":%d,\"G_settle_max_s\":%.3f}\n",
            L, fin ? "true" : "false", rmsDb(mic, 0, L), rmsDb(A, 0, L), rmsDb(B1, 0, L), rmsDb(C2, 0, L), rmsDb(D1, 0, std::min(L, D1.size())), rmsDb(E2, 0, std::min(L, E2.size())),
-           nsw, fSteady, gSteady, fJump, gJump, settleMax);
+           nsw, fSteady, gSteady, fJump, gJump, nReopen, nUnsettled, settleMax);
     ans48_destroy(n); return 0;
 }
