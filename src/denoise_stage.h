@@ -101,7 +101,7 @@ struct StreamDenoiseT {
     std::vector<float> win, inbuf, num, den, re, im, mag, mask, fifo;
     std::vector<float> invDen;   // 稳态时重叠相加分母的倒数（只由窗定，prepare 里算好；见 frame）
     int fill = 0;          // 当前 hop 已攒了几个样本
-    int nFr = 0;           // reset 以来处理过的帧数（凑满 nFft / hop 帧后分母进入稳态）
+    int nFr = 0;           // reset 以来处理过的帧数，饱和在 nFft / hop（凑满后分母进入稳态）
     uint64_t fifoR = 0, fifoW = 0;   // 按样本累计的读 / 写位置。64 位：32 位平台上 size_t 约 24.9 h（48 kHz）就回绕，旧的 fifoR < fifoW 判断会从此恒假、持续输出 0
 
     void prepare(N* n_, int nFft_, int hop_, int bins_) {
@@ -153,7 +153,8 @@ struct StreamDenoiseT {
         std::fill(num.end() - hop, num.end(), 0.0f);
         for (int i = 0; i < nFft; ++i) num[i] += win[i] * tf[i] * inv;
         const size_t mask_ = fifo.size() - 1;
-        if (++nFr >= nFft / hop) {
+        if (nFr < nFft / hop) ++nFr;   // 饱和在阈值：只用来区分开头几帧与稳态，长时间运行不能溢出（0.4.1，审查指出 int 每帧递增约 66 天溢出、退回开头分支）
+        if (nFr >= nFft / hop) {
             // 10-14：凑满 nFft / hop 帧后分母只由窗定（各帧窗平方的重叠和），乘准备期算好的倒数，省掉每帧 hop 次除法与分母的整块搬移（差 ≤1 ulp）
             for (int i = 0; i < hop; ++i) fifo[(size_t)((fifoW + i) & mask_)] = num[i] * invDen[i];
         } else {   // 开头几帧：前面还没有帧叠上来，分母照原式逐帧累加

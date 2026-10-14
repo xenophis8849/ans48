@@ -39,5 +39,14 @@ int main(int argc, char** argv) {
             printf("%s  %s：计数器从 %s 回绕点前 20000 样本起，%.1f s 输出与从 0 起逐样本%s\n", ok ? "通过  " : "不通过", m.name, start > 0xFFFFFFFFull ? "2^64" : "2^32", x.size() / 48000.0, ok ? "相同" : "不同");
         }
     }
+    // 0.4.1：开头几帧计数器饱和在 nFft / hop（原来每帧递增，48 kHz 耳返约 66 天 int 溢出、退回开头分支）；reset 后归零
+    for (const M& m : ms) {
+        ulk::Net net; if (!net.w.loadFromMemory(m.bin, m.n, (const char*)m.js) || !net.prepare()) return 1; net.reset();
+        dns::StreamDenoise sd; sd.prepare(&net); std::vector<float> y(x.size());
+        for (size_t i = 0; i < x.size(); i += 480) sd.process(&x[i], &y[i], (int)std::min<size_t>(480, x.size() - i));
+        const int top = sd.nFft / sd.hop; const bool sat = sd.nFr == top; sd.reset(); const bool rz = sd.nFr == 0;
+        if (!(sat && rz)) ++fails;
+        printf("%s  %s：%.1f s 后开头帧计数 = %d（应饱和在 %d），reset 后 = 0：%s\n", sat && rz ? "通过  " : "不通过", m.name, x.size() / 48000.0, sat ? top : -1, top, rz ? "是" : "否");
+    }
     printf("%s：不通过 %d 项\n", fails ? "有问题" : "全部通过", fails); return fails ? 1 : 0;
 }
