@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -32,7 +33,7 @@ const int kSpecNfft = 1536, kSpecHop = 384, kSpecBins = kSpecNfft / 2 + 1;
 }  // namespace
 
 struct Ans48 {
-    ulk::Net net; dns::StreamDenoise sd; int mode = 0, sr = 48000; float maxG = 2.f;
+    std::unique_ptr<ulk_if::INet> net; dns::StreamDenoiseT<ulk_if::INet> sd; int mode = 0, sr = 48000; float maxG = 2.f;   // net：按 CPU 能力选的那份内核（net_select.cpp）
     std::vector<float> smag, smask;   // 频谱档：每帧的 log 幅度与掩码（prepare 时分配，处理期不分配）
     std::atomic<float> gamma{1.f};
     float fin[kChunk], fout[kChunk];
@@ -61,7 +62,7 @@ static void run(Ans48* a, const float* in, float* out, int n) {
 }
 
 extern "C" {
-const char* ans48_version(void) { static const std::string v = std::string("ans48 0.3.0 (") + ans48_model_id + ")"; return v.c_str(); }
+const char* ans48_version(void) { static const std::string v = std::string("ans48 0.4.0 (") + ans48_model_id + ")"; return v.c_str(); }
 
 Ans48* ans48_create(int sample_rate, int mode) {
     if ((sample_rate != 48000 && sample_rate != 44100) || (mode != ANS48_MODE_MONITOR && mode != ANS48_MODE_STREAM)) return nullptr;
@@ -69,10 +70,11 @@ Ans48* ans48_create(int sample_rate, int mode) {
     try {
         a = new Ans48(); a->mode = mode; a->sr = sample_rate; a->maxG = 2.f;   // 10-13 起三档上限都是 2（推流档原为 1）
         const bool r48 = sample_rate == 48000; bool ok;
-        if (mode == ANS48_MODE_MONITOR) ok = a->net.w.loadFromMemory(ans48_w256_bin, ans48_w256_bin_size, (const char*)(r48 ? ans48_w256_48k_json : ans48_w256_44k_json));
-        else ok = a->net.w.loadFromMemory(ans48_w1024_bin, ans48_w1024_bin_size, (const char*)(r48 ? ans48_w1024_48k_json : ans48_w1024_44k_json));
-        if (!ok || a->net.w.fs != sample_rate || !a->net.prepare()) { delete a; return nullptr; }
-        a->net.reset(); a->sd.prepare(&a->net); a->lastStat = std::chrono::steady_clock::now();
+        a->net.reset(ulk_if::newNet());
+        if (mode == ANS48_MODE_MONITOR) ok = a->net->load(ans48_w256_bin, ans48_w256_bin_size, (const char*)(r48 ? ans48_w256_48k_json : ans48_w256_44k_json));
+        else ok = a->net->load(ans48_w1024_bin, ans48_w1024_bin_size, (const char*)(r48 ? ans48_w1024_48k_json : ans48_w1024_44k_json));
+        if (!ok || !a->net->prepare() || a->net->fs != sample_rate) { delete a; return nullptr; }
+        a->net->reset(); a->sd.prepare(a->net.get(), a->net->nFft, a->net->hop, a->net->bins); a->lastStat = std::chrono::steady_clock::now();
         return a;
     } catch (...) { delete a; return nullptr; }   // 内存不足 / 权重不符：返回 NULL，不结束宿主进程
 }
@@ -83,30 +85,26 @@ Ans48* ans48_create_spec(int sample_rate, int nfft, int hop, int window_id) {
     try {
         a = new Ans48(); a->mode = kModeSpec; a->sr = sample_rate; a->maxG = 2.f;
         const bool r48 = sample_rate == 48000;
-        const bool ok = a->net.w.loadFromMemory(ans48_w1536_bin, ans48_w1536_bin_size, (const char*)(r48 ? ans48_w1536_48k_json : ans48_w1536_44k_json));
+        a->net.reset(ulk_if::newNet());
+        const bool ok = a->net->load(ans48_w1536_bin, ans48_w1536_bin_size, (const char*)(r48 ? ans48_w1536_48k_json : ans48_w1536_44k_json));
         // 嵌入的模型必须正是按契约分帧训的那一份：窗长、帧移、频点数、采样率逐项核
-        if (!ok || a->net.w.fs != sample_rate || a->net.w.nFft != kSpecNfft || a->net.w.hop != kSpecHop || !a->net.prepare() || a->net.bins != kSpecBins) { delete a; return nullptr; }
+        if (!ok || !a->net->prepare() || a->net->fs != sample_rate || a->net->nFft != kSpecNfft || a->net->hop != kSpecHop || a->net->bins != kSpecBins) { delete a; return nullptr; }
         a->smag.assign(kSpecBins, 0.f); a->smask.assign(kSpecBins, 0.f);
-        a->net.reset(); a->lastStat = std::chrono::steady_clock::now();
+        a->net->reset(); a->lastStat = std::chrono::steady_clock::now();
         return a;
     } catch (...) { delete a; return nullptr; }
 }
 
-// 与推流档外圈 StreamDenoise::frame 中「幅度 → log10 → 网络 → 掩码限到 [0,1] → ^γ → 乘回」逐字同式，只是频谱由 aec48 给、不做 FFT
+// 与推流档外圈 StreamDenoise::frame 中「幅度 → log10 → 网络 → 掩码限到 [0,1] → ^γ → 乘回」同一组函数（dns::logMag / applyMask），只是频谱由 aec48 给、不做 FFT
 void ans48_spec_frame(void* user, float* re, float* im, int bins) {
     Ans48* a = (Ans48*)user;
     if (!a || a->mode != kModeSpec || !re || !im || bins != kSpecBins) return;
     const auto t0 = std::chrono::steady_clock::now();
     const float g = a->gamma.load(std::memory_order_relaxed);
     float* mag = a->smag.data(); float* mask = a->smask.data();
-    for (int k = 0; k < bins; ++k) { const float m = sqrtf(re[k] * re[k] + im[k] * im[k]); mag[k] = log10f(m < 1e-12f ? 1e-12f : m); }
-    a->net.run(mag, mask);
-    for (int k = 0; k < bins; ++k) {
-        float v = mask[k];
-        if (v < 0.0f) v = 0.0f; else if (v > 1.0f) v = 1.0f;
-        if (g != 1.0f) v = powf(v, g);
-        re[k] *= v; im[k] *= v;
-    }
+    dns::logMag(re, im, mag, bins);
+    a->net->run(mag, mask);
+    dns::applyMask(re, im, mask, bins, g);
     statFrame(a, t0);
     a->samples.fetch_add(kSpecHop, std::memory_order_relaxed);
 }
@@ -135,7 +133,7 @@ float ans48_set_strength(Ans48* a, float g) {
 float ans48_get_strength(const Ans48* a) { return a ? a->gamma.load(std::memory_order_relaxed) : 0.f; }
 float ans48_max_strength(const Ans48* a) { return a ? a->maxG : 0.f; }
 int ans48_latency_samples(const Ans48* a) { return a && a->mode != kModeSpec ? a->sd.nFft : 0; }
-void ans48_reset(Ans48* a) { if (!a) return; if (a->mode == kModeSpec) a->net.reset(); else a->sd.reset(); }
+void ans48_reset(Ans48* a) { if (!a) return; if (a->mode == kModeSpec) a->net->reset(); else a->sd.reset(); }
 void ans48_stats(const Ans48* a, double o[3]) { if (!a || !o) return; o[0] = a->avgMs; o[1] = a->maxMs; o[2] = (double)a->samples.load(); }
 void ans48_destroy(Ans48* a) { delete a; }
 }

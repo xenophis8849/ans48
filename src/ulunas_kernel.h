@@ -12,9 +12,17 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include <unordered_map>
 
-namespace ulk {
+// 命名空间可配置（10-14）：armeabi-v7a 把整个内核以 -mfpu=neon-vfpv4 再编一份放进 ulk_vfpv4（见 ulunas_kernel_vfpv4.cpp），
+// 运行时按 CPU 能力选（net_select.cpp）。默认 ulk。
+#ifndef ULK_NS
+#define ULK_NS ulk
+#endif
+namespace ULK_NS {
 
 struct Tensor {
     const float* p = nullptr;
@@ -53,6 +61,14 @@ void gruBidir(const float* x, int len, int nIn, int nHid,
 /** y = W·x + b。W 为 (out, in) 行主序。 */
 void linear(const float* x, int nIn, const float* W, const float* b, int nOut, float* y);
 
+/** 按列打包的矩阵（10-14）：wt 为 [nIn][P]，P = nOut 向上取 4 的倍数（多出的列补零），b 也补到 P（无偏置时全零）。
+ *  gemvT 用：一次 16 个输出向量化，每个输出仍是「偏置 + 按输入下标依次累加」，与逐行写法同序。 */
+struct ColMat {
+    int nIn = 0, nOut = 0, P = 0;
+    std::vector<float> wt, b;
+    void pack(const float* W /*(nOut, nIn) 行主序*/, const float* bias /*可空*/, int nOut, int nIn);
+};
+
 /** 频率注意力 FA：对通道求平方均值 → 补齐到 r 的倍数 → 双向 GRU → fc → 裁回。 */
 struct FA {
     int nF = 0, padLen = 0, H = 0, r = 4;
@@ -71,7 +87,8 @@ struct CTFA {
     int C = 0, nF = 0, hid = 0;
     const float *Wih = nullptr, *Whh = nullptr, *bih = nullptr, *bhh = nullptr;
     const float *fcW = nullptr, *fcB = nullptr;
-    std::vector<float> h, zt, at, gates, af;
+    std::vector<float> h, zt, at, gates, gh, af;
+    ColMat wi, wh, fc;   // 时间方向 GRU 的输入 / 隐状态权重与 ta_fc，按列打包（10-14）
     FA fa;
     void prepare(const Weights& w, const std::string& pfx, int channels, int nFreq);
     void reset();
@@ -79,16 +96,28 @@ struct CTFA {
     void run(float* x /*就地，(C,nF)*/, float* out = nullptr, const int* outRow = nullptr, const float* res = nullptr);
 };
 
-/** 逐通道逐频点仿射 + PReLU。 */
+/** 逐通道逐频点仿射 + PReLU：y = aw·x + ab + PReLU(x)。
+ *  10-14 起按等价式 y = (aw + s)·x + ab + (1 − s)·max(x, 0) 算（s = 该通道的 PReLU 斜率）：(aw + s) 在 prepare 里逐点算好，
+ *  每个元素 3 次运算（原式 7 次），读取次数不变。舍入与原式不同，差在 1 ulp 量级。 */
 struct AffinePReLU {
     int C = 0, nF = 0;
     const float *aw = nullptr, *ab = nullptr, *slope = nullptr;
+    std::vector<float> bw, sc;   // bw = aw + slope[c]（逐点），sc = 1 − slope[c]（逐通道）
     void prepare(const Weights& w, const std::string& pfx, int channels, int nFreq);
     void run(float* x) const;
     // 只处理第 c 个通道的一行（卷积写完一行就地做，省一遍整块读写）
     inline void row(float* __restrict r, int c) const {
-        const float* __restrict aws = aw + (size_t)c * nF; const float* __restrict abs_ = ab + (size_t)c * nF; const float sl = slope[c];
-        for (int f = 0; f < nF; ++f) { const float v = r[f]; r[f] = aws[f] * v + abs_[f] + (std::max(v, 0.0f) + sl * std::min(v, 0.0f)); }   // 无分支（= v > 0 ? v : sl·v）
+        const float* __restrict b = bw.data() + (size_t)c * nF; const float* __restrict a = ab + (size_t)c * nF; const float s = sc[c];
+        int f = 0;
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__aarch64__)
+        // armv7 上编译器不向量化这个循环（逐元素标量 vcmp + vmrs），显式 NEON 4 个一组；式子同下面的标量尾巴。64 位编译器本来就向量化了。
+        const float32x4_t vs = vdupq_n_f32(s), z = vdupq_n_f32(0.0f);
+        for (; f + 4 <= nF; f += 4) {
+            const float32x4_t v = vld1q_f32(r + f);
+            vst1q_f32(r + f, vaddq_f32(vaddq_f32(vmulq_f32(vld1q_f32(b + f), v), vld1q_f32(a + f)), vmulq_f32(vs, vmaxq_f32(v, z))));
+        }
+#endif
+        for (; f < nF; ++f) { const float v = r[f]; r[f] = b[f] * v + a[f] + s * std::max(v, 0.0f); }
     }
 };
 
@@ -172,7 +201,8 @@ struct DPGRNN {
     // (C,F) 布局版用：输入投影 / 门值 [3H][F]、两个 LayerNorm 的转置权重（原权重按 (F,C) 排）
     std::vector<float> pj, gx, gh, ilnWT, ilnBT, elnWT, elnBT;
     std::vector<float> pkIntra[4], pkIfc, pkEfc, pkEx[2], pkEh[2];
-    std::vector<float> pj4, uT4, bh4;   // 隐层 4 时：4 条频率递推各自的输入投影、转置的 U、b_hh（intraRec4x）   // 各逐点投影 / 全连接的转置打包权重（packPw）
+    std::vector<float> pj4, uT4, bh4;   // 隐层 ≤4 时：4 条频率递推各自的输入投影、转置的 U、b_hh（intraRec4x；隐层不足 4 补零到 4）
+    std::vector<float> wih4[4], bih4[4];   // 同上，补零到每门 4 行的输入投影权重 / 偏置（隐层 4 时就是原权重）
     void prepare(const Weights& w, const std::string& pfx, int channels, int width);
     void reset();
     void run(float* x /*就地 (C,F)*/);
@@ -218,4 +248,4 @@ struct Net {
     void run(const float* logmag, float* mask);
 };
 
-}  // namespace ulk
+}  // namespace ULK_NS

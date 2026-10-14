@@ -7,8 +7,15 @@
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #endif
+// 32 位 ARM（armeabi-v7a）专用的乘加内联汇编（10-14）。AArch32 的融合乘加（vfma，且要 vfpv4）没有「乘以某个通道」的形式，
+// 编译器在 -ffast-math 下又不生成非融合的 vmla，于是每次向量乘加拆成乘、加两条（小核实测 32 位比 64 位慢约 1.5 倍）。
+// vmla.f32 q, q, d[x]（NEON 基本指令，所有 armv7 NEON 设备都有）一条完成，结果与「先乘后加」逐位相同，即与原 32 位编译输出一致。
+// 汇编要整块写：拆成单条指令的小函数时编译器排不好，微基准只剩 1.24 倍（整块 1.77 倍）。
+#if defined(__arm__) && !defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define ULK_ARM32_VMLA 1
+#endif
 
-namespace ulk {
+namespace ULK_NS {
 
 // ---- 极简 JSON 取数（只够读权重清单，不是通用解析器）--------
 // 清单是我们自己生成的、结构固定，所以不引第三方库。**只在加载期跑一次。**
@@ -120,6 +127,7 @@ struct OpTimer { int k; long long t0; explicit OpTimer(int k_) : k(k_) { timespe
 static inline float sigmoidf_(float x) { x = x < -80.f ? -80.f : (x > 80.f ? 80.f : x); return 1.0f / (1.0f + expf(-x)); }   // 精确版（只留作对照）
 // 激活：tanh 用 Eigen 的 13/6 次有理逼近（全实数轴最大绝对误差 3.3e-7），sigmoid = 0.5·tanh(x/2) + 0.5（误差 2.3e-7）。
 // 无 exp、可向量化，且自带限幅不会溢出。整张网络每帧有几千次 tanh / sigmoid（GRU 门控与注意力），逐个调 libm 是主要耗时。
+// 10-14 另有一个省的向量版（vtanhF / vsigmF，见下），只用在帧内的计算上。
 static inline float ftanh(float x) {
     x = std::min(7.90531110763549805f, std::max(-7.90531110763549805f, x)); const float x2 = x * x;
     float p = x2 * -2.76076847742355e-16f + 2.00018790482477e-13f; p = p * x2 + -8.60467152213735e-11f; p = p * x2 + 5.12229709037114e-08f; p = p * x2 + 1.48572235717979e-05f; p = p * x2 + 6.37261928875436e-04f; p = p * x2 + 4.89352455891786e-03f; p = p * x;
@@ -220,16 +228,20 @@ void shuffle2(const float* x, int C2, int nF, float* y) {
     }
 }
 
+// 10-14：原来均值、方差用 double 标量累加（32 位 NEON 没有双精度向量，整段标量 VFP）。改成 float、4 路 × 2 组向量累加，
+// 两遍（先均值再方差，不用 E[x²]−m² 那种相消写法）；N = F×C 只有几百，float 累加的相对误差 ~1e-7，远在输出 1 LSB 之下。
 void layerNorm(float* x, int nF, int C, const float* w, const float* b, float eps) {
-    const int N = nF * C;
-    double m = 0.0;
-    for (int i = 0; i < N; ++i) m += x[i];
-    m /= N;
-    double v = 0.0;
-    for (int i = 0; i < N; ++i) { double d = x[i] - m; v += d * d; }
-    v /= N;
-    const float inv = (float)(1.0 / sqrt(v + eps));
-    for (int i = 0; i < N; ++i) x[i] = ((float)(x[i] - m)) * inv * w[i] + b[i];
+    const int N = nF * C, N8 = N & ~7;
+    v4f s0 = {0, 0, 0, 0}, s1 = s0; int i = 0;
+    for (; i < N8; i += 8) { s0 += ld4(x + i); s1 += ld4(x + i + 4); }
+    v4f sv = s0 + s1; float sum = sv[0] + sv[1] + sv[2] + sv[3]; for (; i < N; ++i) sum += x[i];
+    const float m = sum / N; const v4f mv = {m, m, m, m};
+    v4f q0 = {0, 0, 0, 0}, q1 = q0;
+    for (i = 0; i < N8; i += 8) { const v4f d0 = ld4(x + i) - mv, d1 = ld4(x + i + 4) - mv; q0 += d0 * d0; q1 += d1 * d1; }
+    v4f qv = q0 + q1; float var = qv[0] + qv[1] + qv[2] + qv[3]; for (; i < N; ++i) { const float d = x[i] - m; var += d * d; }
+    const float inv = 1.0f / sqrtf(var / N + eps);
+    for (i = 0; i + 4 <= N; i += 4) st4(x + i, (ld4(x + i) - mv) * inv * ld4(w + i) + ld4(b + i));
+    for (; i < N; ++i) x[i] = (x[i] - m) * inv * w[i] + b[i];
 }
 
 // ---- FA ----------------------------------------------------------------
@@ -266,12 +278,107 @@ void FA::prepare(const Weights& w, const std::string& pfx, int nFreq) {
 }
 
 // 4 宽的向量版 tanh / sigmoid：与 ftanh / fsigm 同一组系数、同一个式子，逐元素算
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+// 10-14：逐通道 std::min/max 在 armv7 上编成 8 次标量 vcmp + vmrs（每个 tanh / sigmoid 都要过一次）；改 NEON 向量 min / max，结果相同
+static inline v4f vclamp(v4f x, float lo, float hi) { float32x4_t v; memcpy(&v, &x, 16); v = vminq_f32(vdupq_n_f32(hi), vmaxq_f32(vdupq_n_f32(lo), v)); memcpy(&x, &v, 16); return x; }
+#else
 static inline v4f vclamp(v4f x, float lo, float hi) { for (int k = 0; k < 4; ++k) x[k] = std::min(hi, std::max(lo, x[k])); return x; }
+#endif
 static inline v4f vtanh(v4f x) {
     x = vclamp(x, -7.90531110763549805f, 7.90531110763549805f); const v4f x2 = x * x;
     v4f p = x2 * -2.76076847742355e-16f + 2.00018790482477e-13f; p = p * x2 + -8.60467152213735e-11f; p = p * x2 + 5.12229709037114e-08f; p = p * x2 + 1.48572235717979e-05f; p = p * x2 + 6.37261928875436e-04f; p = p * x2 + 4.89352455891786e-03f; p = p * x;
-    v4f q = x2 * 1.19825839466702e-06f + 1.18534705686654e-04f; q = q * x2 + 2.26843463243900e-03f; q = q * x2 + 4.89352518554385e-03f; return p / q; }
+    v4f q = x2 * 1.19825839466702e-06f + 1.18534705686654e-04f; q = q * x2 + 2.26843463243900e-03f; q = q * x2 + 4.89352518554385e-03f;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // 10-14：除法换成倒数估计 + 两步牛顿（8 → 16 → 约 23 位）。32 位 NEON 没有向量除法，每个 p / q 被拆成 4 次标量 vdiv（不流水）；
+    // 64 位的向量 fdiv 也不流水。q ≥ 4.89e-3 > 0，倒数估计不会遇到 0 或无穷。与除法的差 ≤ 约 2 ulp。
+    float32x4_t qq; memcpy(&qq, &q, 16); float32x4_t r = vrecpeq_f32(qq); r = vmulq_f32(r, vrecpsq_f32(qq, r)); r = vmulq_f32(r, vrecpsq_f32(qq, r));
+    v4f rv; memcpy(&rv, &r, 16); return p * rv;
+#else
+    return p / q;
+#endif
+}
 static inline v4f vsigm(v4f x) { return 0.5f * vtanh(0.5f * x) + 0.5f; }
+// 省的版本（10-14）：tanh(x) ≈ x·P(x²) / Q(x²)，P、Q 各 4 项（Q 首项 1），|x| 限到 6.2；按最小最大误差拟合，单精度实测全实数轴最大绝对误差
+// 4.3e-6（sigmoid 2.1e-6，值域在 (0, 1) 内）。常数 9 个（原 13 个，32 位只有 16 个向量寄存器时放不下、每次从栈上重读），依赖链上 3 级乘加（原 6 级）。
+// 采样剖析：vivo 小核 32 位 tanh / sigmoid 占整帧约 17%；全用省的版本整帧 32 位快 4.4%、64 位快 2.5–3%，但对 Python 参照的差从 −100 dB 升到
+// −84 ~ −95 dB——误差在跨帧传状态的 GRU 里累积。所以只用在帧内的计算（FA、DPGRNN 频率向、cTFA 的注意力）；跨帧的 GRU 与最后的掩码仍用精确版。
+static inline v4f vtanhF(v4f x) {
+    x = vclamp(x, -6.2f, 6.2f); const v4f u = x * x;
+    const v4f p = x * (((5.0283365250e-06f * u + 2.4888445960e-03f) * u + 1.2529732236e-01f) * u + 9.9999994728e-01f);
+    const v4f q = ((1.6633075012e-04f * u + 2.2032966665e-02f) * u + 4.5863027414e-01f) * u + 1.0f;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    float32x4_t qq; memcpy(&qq, &q, 16); float32x4_t r = vrecpeq_f32(qq); r = vmulq_f32(r, vrecpsq_f32(qq, r)); r = vmulq_f32(r, vrecpsq_f32(qq, r));   // q ≥ 1
+    v4f rv; memcpy(&rv, &r, 16); return p * rv;
+#else
+    return p / q;
+#endif
+}
+static inline v4f vsigmF(v4f x) { return 0.5f * vtanhF(0.5f * x) + 0.5f; }
+// FA 专用：同 vtanhF，倒数只做一步牛顿（约 17 位，相对误差 ≤ 7.6e-6）。32 位整帧快约 2–3%；全网都用时频谱档对 Python 参照从 −96 ~ −101 dB 降到 −92 ~ −97，
+// 离自检门槛 −90 dB 太近，所以只给调用最多的 FA（10-14）。
+static inline v4f vtanhF1(v4f x) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    x = vclamp(x, -6.2f, 6.2f); const v4f u = x * x;
+    const v4f p = x * (((5.0283365250e-06f * u + 2.4888445960e-03f) * u + 1.2529732236e-01f) * u + 9.9999994728e-01f);
+    const v4f q = ((1.6633075012e-04f * u + 2.2032966665e-02f) * u + 4.5863027414e-01f) * u + 1.0f;
+    float32x4_t qq; memcpy(&qq, &q, 16); float32x4_t r = vrecpeq_f32(qq); r = vmulq_f32(r, vrecpsq_f32(qq, r));   // q ≥ 1
+    v4f rv; memcpy(&rv, &r, 16); return p * rv;
+#else
+    return vtanhF(x);
+#endif
+}
+static inline v4f vsigmF1(v4f x) { return 0.5f * vtanhF1(0.5f * x) + 0.5f; }
+
+void ColMat::pack(const float* W, const float* bias, int nOut_, int nIn_) {
+    nOut = nOut_; nIn = nIn_; P = (nOut + 3) & ~3;
+    wt.assign((size_t)nIn * P, 0.0f); b.assign(P, 0.0f);
+    for (int o = 0; o < nOut; ++o) { for (int i = 0; i < nIn; ++i) wt[(size_t)i * P + o] = W[(size_t)o * nIn + i]; if (bias) b[o] = bias[o]; }
+}
+
+// y = W·x + b（y 至少 P 个）：一次 16 个输出、4 个累加向量，按输入下标依次累加——每个输出与 gemv4 的标量写法同式同序。
+// 原写法（gemv4）是 4 行标量乘加，小核上每次乘加约 2 个时钟周期；时间方向 GRU 的权重每帧只用一次，全是这种矩阵 × 向量。
+static inline void gemvT(const ColMat& m, const float* __restrict x, float* __restrict y) {
+    const int P = m.P, nIn = m.nIn; const float* __restrict W = m.wt.data(); const float* __restrict b = m.b.data();
+    int o = 0;
+    for (; o + 16 <= P; o += 16) {
+#ifdef ULK_ARM32_VMLA
+        float32x4_t a0 = vld1q_f32(b + o), a1 = vld1q_f32(b + o + 4), a2 = vld1q_f32(b + o + 8), a3 = vld1q_f32(b + o + 12);
+        const float* __restrict w = W + o; int i = 0;
+        for (; i + 2 <= nIn; i += 2, w += 2 * P) {   // 一次两个输入：每个累加器先加第 i 项、再加第 i+1 项，与逐项写法同序
+            const float32x4_t xv = vcombine_f32(vld1_f32(x + i), vld1_f32(x + i));
+            const float32x4_t w0 = vld1q_f32(w), w1 = vld1q_f32(w + 4), w2 = vld1q_f32(w + 8), w3 = vld1q_f32(w + 12);
+            const float32x4_t u0 = vld1q_f32(w + P), u1 = vld1q_f32(w + P + 4), u2 = vld1q_f32(w + P + 8), u3 = vld1q_f32(w + P + 12);
+            __asm__("vmla.f32 %q0, %q4, %e12[0]\n\tvmla.f32 %q1, %q5, %e12[0]\n\tvmla.f32 %q2, %q6, %e12[0]\n\tvmla.f32 %q3, %q7, %e12[0]\n\t"
+                    "vmla.f32 %q0, %q8, %e12[1]\n\tvmla.f32 %q1, %q9, %e12[1]\n\tvmla.f32 %q2, %q10, %e12[1]\n\tvmla.f32 %q3, %q11, %e12[1]"
+                    : "+w"(a0), "+w"(a1), "+w"(a2), "+w"(a3) : "w"(w0), "w"(w1), "w"(w2), "w"(w3), "w"(u0), "w"(u1), "w"(u2), "w"(u3), "x"(xv));
+        }
+        for (; i < nIn; ++i, w += P) { const float32x4_t xv = vdupq_n_f32(x[i]);
+            __asm__("vmla.f32 %q0, %q4, %q8\n\tvmla.f32 %q1, %q5, %q8\n\tvmla.f32 %q2, %q6, %q8\n\tvmla.f32 %q3, %q7, %q8"
+                    : "+w"(a0), "+w"(a1), "+w"(a2), "+w"(a3) : "w"(vld1q_f32(w)), "w"(vld1q_f32(w + 4)), "w"(vld1q_f32(w + 8)), "w"(vld1q_f32(w + 12)), "w"(xv)); }
+        vst1q_f32(y + o, a0); vst1q_f32(y + o + 4, a1); vst1q_f32(y + o + 8, a2); vst1q_f32(y + o + 12, a3);
+#else
+        v4f a0 = ld4(b + o), a1 = ld4(b + o + 4), a2 = ld4(b + o + 8), a3 = ld4(b + o + 12);
+        const float* __restrict w = W + o;
+        for (int i = 0; i < nIn; ++i, w += P) { const float xv = x[i]; a0 += xv * ld4(w); a1 += xv * ld4(w + 4); a2 += xv * ld4(w + 8); a3 += xv * ld4(w + 12); }
+        st4(y + o, a0); st4(y + o + 4, a1); st4(y + o + 8, a2); st4(y + o + 12, a3);
+#endif
+    }
+    for (; o < P; o += 4) { v4f a = ld4(b + o); const float* __restrict w = W + o; for (int i = 0; i < nIn; ++i, w += P) a += x[i] * ld4(w); st4(y + o, a); }
+}
+
+// GRU 门控（g = W_ih·x + b_ih，gh = W_hh·h + b_hh，各 3H），4 个隐单元一组向量化；式子与 gruStep 相同（b_hn 在 r ⊙ 括号里）。
+static inline void gruGates(const float* __restrict g, const float* __restrict gh, float* __restrict h, int H) {
+    int i = 0;
+    for (; i + 4 <= H; i += 4) {
+        const v4f r = vsigm(ld4(g + i) + ld4(gh + i)), z = vsigm(ld4(g + H + i) + ld4(gh + H + i));
+        const v4f n = vtanh(ld4(g + 2 * H + i) + r * ld4(gh + 2 * H + i));
+        st4(h + i, (1.0f - z) * n + z * ld4(h + i));
+    }
+    for (; i < H; ++i) {
+        const float r = fsigm(g[i] + gh[i]), z = fsigm(g[H + i] + gh[H + i]), n = ftanh(g[2 * H + i] + r * gh[2 * H + i]);
+        h[i] = (1.0f - z) * n + z * h[i];
+    }
+}
 
 // FA 的一步 GRU（输入 4、隐层 4），四个隐单元放一个向量里一起算。各门 = 偏置 + 按输入下标依次累加，式子与 gruStepT<4,4> 相同。
 static inline v4f faStep(v4f xv, v4f h, const float* wx, const float* wh, const float* bx, const float* bh) {
@@ -282,7 +389,7 @@ static inline v4f faStep(v4f xv, v4f h, const float* wx, const float* wh, const 
         for (int i = 0; i < 4; ++i) { a += xs[i] * ld4(wx + (q * 4 + i) * 4); c += hs[i] * ld4(wh + (q * 4 + i) * 4); }
         g[q] = a; gh[q] = c;
     }
-    const v4f rr = vsigm(g[0] + gh[0]), zz = vsigm(g[1] + gh[1]), nn = vtanh(g[2] + rr * gh[2]);
+    const v4f rr = vsigmF1(g[0] + gh[0]), zz = vsigmF1(g[1] + gh[1]), nn = vtanhF1(g[2] + rr * gh[2]);
     return (1.0f - zz) * nn + zz * h;
 }
 
@@ -290,9 +397,23 @@ static inline v4f faStep(v4f xv, v4f h, const float* wx, const float* wh, const 
 // 一步内四个隐单元向量化。频点能量按通道逐行累加（每个频点仍是 0 + 按通道依次累加，再除以 C）。
 void FA::run(const float* x, int C, float* out) {
     float* __restrict pd = pad.data();
-    for (int f = 0; f < nF + padLen; ++f) pd[f] = 0.0f;
-    for (int c = 0; c < C; ++c) { const float* __restrict row = x + (size_t)c * nF; for (int f = 0; f < nF; ++f) pd[f] += row[f] * row[f]; }
-    for (int f = 0; f < nF; ++f) pd[f] = pd[f] / C;
+    // 频点能量 = 各通道平方和 × 1/C。10-14：改成一组频点在寄存器里跨全部通道累加完再写一次——原写法按通道逐行
+    // 读-加-写同一行累加缓冲，每个通道都要等上一个通道刚写回的值（采样剖析：vivo 小核 32 位这一段占 FA 一半以上）。
+    // 每个频点仍是 0 + 按通道依次累加，结果不变。
+    const float invC = 1.0f / C;   // 10-14：除法换乘倒数（差 ≤1 ulp；每帧几百次标量除法）
+    int f = 0;
+    for (; f + 8 <= nF; f += 8) {
+        v4f a0 = {0, 0, 0, 0}, a1 = a0;
+        for (int c = 0; c < C; ++c) { const float* r = x + (size_t)c * nF + f; const v4f v0 = ld4(r), v1 = ld4(r + 4); a0 += v0 * v0; a1 += v1 * v1; }
+        st4(pd + f, a0 * invC); st4(pd + f + 4, a1 * invC);
+    }
+    for (; f + 4 <= nF; f += 4) {
+        v4f a0 = {0, 0, 0, 0};
+        for (int c = 0; c < C; ++c) { const v4f v0 = ld4(x + (size_t)c * nF + f); a0 += v0 * v0; }
+        st4(pd + f, a0 * invC);
+    }
+    for (; f < nF; ++f) { float a = 0.0f; for (int c = 0; c < C; ++c) { const float v = x[(size_t)c * nF + f]; a += v * v; } pd[f] = a * invC; }
+    for (; f < nF + padLen; ++f) pd[f] = 0.0f;
     float* __restrict go = gruOut.data();
     v4f hf = {0, 0, 0, 0}, hb = hf;
     const float *wx0 = wx.data(), *wh0 = wh.data(), *bx0 = bx.data(), *bh0 = bh.data();
@@ -316,7 +437,8 @@ void FA::run(const float* x, int C, float* out) {
 // ---- cTFA --------------------------------------------------------------
 
 void CTFA::prepare(const Weights& w, const std::string& pfx, int channels, int nFreq) {
-    C = channels; nF = nFreq; hid = 2 * C;
+    C = channels; nF = nFreq;
+    { const int64_t n = w.at(pfx + ".ta_gru.weight_hh_l0").n; hid = (int)lrint(sqrt(n / 3.0)); }   // 原版隐层 = 2C；10-14 起按权重形状取（小核变体可缩到 C）
     Wih = w.at(pfx + ".ta_gru.weight_ih_l0").p;
     Whh = w.at(pfx + ".ta_gru.weight_hh_l0").p;
     bih = w.at(pfx + ".ta_gru.bias_ih_l0").p;
@@ -325,9 +447,10 @@ void CTFA::prepare(const Weights& w, const std::string& pfx, int channels, int n
     fcB = w.at(pfx + ".ta_fc.bias").p;
     fa.prepare(w, pfx + ".fa", nF);
     h.assign(hid, 0.0f);
-    zt.assign(C, 0.0f); at.assign(C, 0.0f);
-    gates.assign(3 * hid, 0.0f);
-    af.assign(nF, 0.0f);
+    wi.pack(Wih, bih, 3 * hid, C); wh.pack(Whh, bhh, 3 * hid, hid); fc.pack(fcW, fcB, C, hid);
+    zt.assign(C, 0.0f); at.assign(fc.P, 0.0f);
+    gates.assign(wi.P, 0.0f); gh.assign(wh.P, 0.0f);
+    af.assign((nF + 3) & ~3, 0.0f);   // 补到 4 的倍数：sigmoid 整向量做（尾部多出的几项不被读）
 }
 
 void CTFA::reset() { std::fill(h.begin(), h.end(), 0.0f); }
@@ -339,16 +462,17 @@ void CTFA::run(float* x, float* out, const int* outRow, const float* res) {
         float s = 0.0f;
         const float* row = x + (size_t)c * nF;
         for (int f = 0; f < nF; ++f) s += row[f] * row[f];
-        zt[c] = s / nF;
+        zt[c] = s * (1.0f / nF);
     }
-    gruStep(zt.data(), C, h.data(), hid, Wih, Whh, bih, bhh, gates.data());
-    linear(h.data(), hid, fcW, fcB, C, at.data());
-    for (int c = 0; c < C; ++c) at[c] = fsigm(at[c]);
+    gemvT(wi, zt.data(), gates.data()); gemvT(wh, h.data(), gh.data());
+    gruGates(gates.data(), gh.data(), h.data(), hid);
+    gemvT(fc, h.data(), at.data());
+    for (int c = 0; c < fc.P; c += 4) st4(&at[c], vsigmF(ld4(&at[c])));   // at 补到 fc.P（多出的列权重为 0），整向量做
   }
   {
     OPT(kOpFa);
     fa.run(x, C, af.data());
-    for (int f = 0; f < nF; ++f) af[f] = fsigm(af[f]);
+    for (int f = 0; f < nF; f += 4) st4(&af[f], vsigmF(ld4(&af[f])));
   }
     OPT(kOpMul);
     if (!out) {
@@ -373,6 +497,8 @@ void AffinePReLU::prepare(const Weights& w, const std::string& pfx, int channels
     aw = w.at(pfx + ".affine_weight").p;
     ab = w.at(pfx + ".affine_bias").p;
     slope = w.at(pfx + ".slope_weight").p;
+    bw.resize((size_t)C * nF); sc.resize(C);
+    for (int c = 0; c < C; ++c) { sc[c] = 1.0f - slope[c]; for (int f = 0; f < nF; ++f) bw[(size_t)c * nF + f] = aw[(size_t)c * nF + f] + slope[c]; }
 }
 
 void AffinePReLU::run(float* x) const {
@@ -425,6 +551,26 @@ std::vector<float> packPw(const float* w, int O, int I) {
 
 // wt 非空（10-13）：4 个输出 × 8 个频点一块，按输入通道读 1 个权重向量（4 个输出的权重，来自 packPw）+ 2 个输入向量、算 8 个向量乘加；
 // 原写法每个通道读 1 个输入向量 + 4 个标量权重、只算 4 个，小核上读多于算（微基准：S10 / vivo 小核快约 22%，输出逐位相同）。
+// 卷积收尾直接接仿射 + PReLU（10-14）：累加值写回前在寄存器里算完，式子与 AffinePReLU::row 相同（等价式，见那里）。
+// 原写法卷积整行写回、激活再整行读出改写；采样剖析（vivo 小核，不插桩）激活那一遍占整帧 12–13%（64 / 32 位都是）。
+struct Epi { const float* bw = nullptr; const float* ab = nullptr; float sc = 0.0f; };
+static inline Epi epiOf(const AffinePReLU* a, int c) {
+    Epi e; if (a) { e.bw = a->bw.data() + (size_t)c * a->nF; e.ab = a->ab + (size_t)c * a->nF; e.sc = a->sc[c]; } return e; }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+static inline float32x4_t epiQ(const Epi& e, float32x4_t x, int f) {
+    if (!e.bw) return x;
+    return vaddq_f32(vaddq_f32(vmulq_f32(vld1q_f32(e.bw + f), x), vld1q_f32(e.ab + f)), vmulq_f32(vdupq_n_f32(e.sc), vmaxq_f32(x, vdupq_n_f32(0.0f))));
+}
+static inline v4f epiV(const Epi& e, v4f v, int f) { if (!e.bw) return v; float32x4_t x; memcpy(&x, &v, 16); x = epiQ(e, x, f); memcpy(&v, &x, 16); return v; }
+#else
+static inline v4f epiV(const Epi& e, v4f v, int f) {
+    if (!e.bw) return v;
+    for (int k = 0; k < 4; ++k) v[k] = e.bw[f + k] * v[k] + e.ab[f + k] + e.sc * std::max(v[k], 0.0f);
+    return v;
+}
+#endif
+static inline float epiS(const Epi& e, float v, int f) { return e.bw ? e.bw[f] * v + e.ab[f] + e.sc * std::max(v, 0.0f) : v; }
+
 static void pw(const float* __restrict w, const float* __restrict b, const float* __restrict x, float* __restrict y, int O, int I, int N,
                const AffinePReLU* act = nullptr, int c0 = 0, const float* __restrict wt = nullptr) {
     const int N4 = N & ~3; int o = 0;
@@ -433,8 +579,20 @@ static void pw(const float* __restrict w, const float* __restrict b, const float
         for (; o + 4 <= O; o += 4) {
             const float* __restrict wb = wt + (size_t)(o / 4) * I * 4;
             float *y0 = y + o * N, *y1 = y0 + N, *y2 = y1 + N, *y3 = y2 + N;
+            const Epi E0 = epiOf(act, c0 + o), E1 = epiOf(act, c0 + o + 1), E2 = epiOf(act, c0 + o + 2), E3 = epiOf(act, c0 + o + 3);
             int n = 0;
             for (; n < N8; n += 8) {
+#ifdef ULK_ARM32_VMLA
+                float32x4_t a0 = vdupq_n_f32(b[o]), a1 = vdupq_n_f32(b[o + 1]), a2 = vdupq_n_f32(b[o + 2]), a3 = vdupq_n_f32(b[o + 3]), e0 = a0, e1 = a1, e2 = a2, e3 = a3;
+                for (int i = 0; i < I; ++i) {
+                    const float32x4_t wv = vld1q_f32(wb + i * 4), xa = vld1q_f32(x + i * N + n), xb = vld1q_f32(x + i * N + n + 4);
+                    __asm__("vmla.f32 %q0, %q8, %e10[0]\n\tvmla.f32 %q1, %q8, %e10[1]\n\tvmla.f32 %q2, %q8, %f10[0]\n\tvmla.f32 %q3, %q8, %f10[1]\n\t"
+                            "vmla.f32 %q4, %q9, %e10[0]\n\tvmla.f32 %q5, %q9, %e10[1]\n\tvmla.f32 %q6, %q9, %f10[0]\n\tvmla.f32 %q7, %q9, %f10[1]"
+                            : "+w"(a0), "+w"(a1), "+w"(a2), "+w"(a3), "+w"(e0), "+w"(e1), "+w"(e2), "+w"(e3) : "w"(xa), "w"(xb), "x"(wv));
+                }
+                vst1q_f32(y0 + n, epiQ(E0, a0, n)); vst1q_f32(y1 + n, epiQ(E1, a1, n)); vst1q_f32(y2 + n, epiQ(E2, a2, n)); vst1q_f32(y3 + n, epiQ(E3, a3, n));
+                vst1q_f32(y0 + n + 4, epiQ(E0, e0, n + 4)); vst1q_f32(y1 + n + 4, epiQ(E1, e1, n + 4)); vst1q_f32(y2 + n + 4, epiQ(E2, e2, n + 4)); vst1q_f32(y3 + n + 4, epiQ(E3, e3, n + 4));
+#else
                 v4f a0 = {b[o], b[o], b[o], b[o]}, a1 = {b[o + 1], b[o + 1], b[o + 1], b[o + 1]}, a2 = {b[o + 2], b[o + 2], b[o + 2], b[o + 2]}, a3 = {b[o + 3], b[o + 3], b[o + 3], b[o + 3]};
                 v4f e0 = a0, e1 = a1, e2 = a2, e3 = a3;
                 for (int i = 0; i < I; ++i) {
@@ -442,43 +600,43 @@ static void pw(const float* __restrict w, const float* __restrict b, const float
                     a0 += xa * wv[0]; a1 += xa * wv[1]; a2 += xa * wv[2]; a3 += xa * wv[3];
                     e0 += xb * wv[0]; e1 += xb * wv[1]; e2 += xb * wv[2]; e3 += xb * wv[3];
                 }
-                st4(y0 + n, a0); st4(y1 + n, a1); st4(y2 + n, a2); st4(y3 + n, a3);
-                st4(y0 + n + 4, e0); st4(y1 + n + 4, e1); st4(y2 + n + 4, e2); st4(y3 + n + 4, e3);
+                st4(y0 + n, epiV(E0, a0, n)); st4(y1 + n, epiV(E1, a1, n)); st4(y2 + n, epiV(E2, a2, n)); st4(y3 + n, epiV(E3, a3, n));
+                st4(y0 + n + 4, epiV(E0, e0, n + 4)); st4(y1 + n + 4, epiV(E1, e1, n + 4)); st4(y2 + n + 4, epiV(E2, e2, n + 4)); st4(y3 + n + 4, epiV(E3, e3, n + 4));
+#endif
             }
             for (; n < N4; n += 4) {
                 v4f a0 = {b[o], b[o], b[o], b[o]}, a1 = {b[o + 1], b[o + 1], b[o + 1], b[o + 1]}, a2 = {b[o + 2], b[o + 2], b[o + 2], b[o + 2]}, a3 = {b[o + 3], b[o + 3], b[o + 3], b[o + 3]};
                 for (int i = 0; i < I; ++i) { const v4f wv = ld4(wb + i * 4); const v4f xa = ld4(x + i * N + n); a0 += xa * wv[0]; a1 += xa * wv[1]; a2 += xa * wv[2]; a3 += xa * wv[3]; }
-                st4(y0 + n, a0); st4(y1 + n, a1); st4(y2 + n, a2); st4(y3 + n, a3);
+                st4(y0 + n, epiV(E0, a0, n)); st4(y1 + n, epiV(E1, a1, n)); st4(y2 + n, epiV(E2, a2, n)); st4(y3 + n, epiV(E3, a3, n));
             }
-            for (; n < N; ++n) { float a[4] = {b[o], b[o + 1], b[o + 2], b[o + 3]};
-                for (int i = 0; i < I; ++i) { const float xv = x[i * N + n]; for (int k = 0; k < 4; ++k) a[k] += wb[i * 4 + k] * xv; }
-                y0[n] = a[0]; y1[n] = a[1]; y2[n] = a[2]; y3[n] = a[3]; }
-            if (act) { act->row(y0, c0 + o); act->row(y1, c0 + o + 1); act->row(y2, c0 + o + 2); act->row(y3, c0 + o + 3); }
+            for (; n < N; ++n) {   // 宽度 17 / 33 时每行剩 1 列：按 4 个输出通道一组向量化（10-14，原为标量，32 位约占整帧 1.7%）；每个输出仍是偏置 + 按 i 依次累加
+                v4f a = {b[o], b[o + 1], b[o + 2], b[o + 3]};
+                for (int i = 0; i < I; ++i) a += ld4(wb + i * 4) * x[i * N + n];
+                y0[n] = epiS(E0, a[0], n); y1[n] = epiS(E1, a[1], n); y2[n] = epiS(E2, a[2], n); y3[n] = epiS(E3, a[3], n); }
         }
     }
     for (; o + 4 <= O; o += 4) {
         const float *w0 = w + o * I, *w1 = w0 + I, *w2 = w1 + I, *w3 = w2 + I; float *y0 = y + o * N, *y1 = y0 + N, *y2 = y1 + N, *y3 = y2 + N;
+        const Epi E0 = epiOf(act, c0 + o), E1 = epiOf(act, c0 + o + 1), E2 = epiOf(act, c0 + o + 2), E3 = epiOf(act, c0 + o + 3);
         for (int n = 0; n < N4; n += 4) {
             v4f a0 = {b[o], b[o], b[o], b[o]}, a1 = {b[o + 1], b[o + 1], b[o + 1], b[o + 1]}, a2 = {b[o + 2], b[o + 2], b[o + 2], b[o + 2]}, a3 = {b[o + 3], b[o + 3], b[o + 3], b[o + 3]};
             for (int i = 0; i < I; ++i) { const v4f xv = ld4(x + i * N + n); a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
-            st4(y0 + n, a0); st4(y1 + n, a1); st4(y2 + n, a2); st4(y3 + n, a3);
+            st4(y0 + n, epiV(E0, a0, n)); st4(y1 + n, epiV(E1, a1, n)); st4(y2 + n, epiV(E2, a2, n)); st4(y3 + n, epiV(E3, a3, n));
         }
         for (int n = N4; n < N; ++n) { float a0 = b[o], a1 = b[o + 1], a2 = b[o + 2], a3 = b[o + 3];
             for (int i = 0; i < I; ++i) { const float xv = x[i * N + n]; a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
-            y0[n] = a0; y1[n] = a1; y2[n] = a2; y3[n] = a3; }
-        if (act) { act->row(y0, c0 + o); act->row(y1, c0 + o + 1); act->row(y2, c0 + o + 2); act->row(y3, c0 + o + 3); }
+            y0[n] = epiS(E0, a0, n); y1[n] = epiS(E1, a1, n); y2[n] = epiS(E2, a2, n); y3[n] = epiS(E3, a3, n); }
     }
-    for (; o < O; ++o) { const float* wo = w + o * I; float* yo = y + o * N;
-        for (int n = 0; n < N4; n += 4) { v4f a = {b[o], b[o], b[o], b[o]}; for (int i = 0; i < I; ++i) a += wo[i] * ld4(x + i * N + n); st4(yo + n, a); }
-        for (int n = N4; n < N; ++n) { float a = b[o]; for (int i = 0; i < I; ++i) a += wo[i] * x[i * N + n]; yo[n] = a; }
-        if (act) act->row(yo, c0 + o); }
+    for (; o < O; ++o) { const float* wo = w + o * I; float* yo = y + o * N; const Epi E = epiOf(act, c0 + o);
+        for (int n = 0; n < N4; n += 4) { v4f a = {b[o], b[o], b[o], b[o]}; for (int i = 0; i < I; ++i) a += wo[i] * ld4(x + i * N + n); st4(yo + n, epiV(E, a, n)); }
+        for (int n = N4; n < N; ++n) { float a = b[o]; for (int i = 0; i < I; ++i) a += wo[i] * x[i * N + n]; yo[n] = epiS(E, a, n); } }
 }
 
 // 深度卷积一行（抽头数编译期固定）：rows[t] 是第 t 个时间帧的补零行，w 按 (t, k) 排；每个输出点 = 偏置 + 按 (t, k) 依次累加。
 // 一次 16 个输出点、4 个互不依赖的累加器：小核（顺序执行）上乘加的结果要等几拍才能接着用，只有 2 个累加器时
 // 每个抽头都在等上一个（10-13 simpleperf 实测热点就是这条依赖链，S10 小核只有 0.4 乘加/ns）。
 template <int KT, int K>
-static inline void dwRowT(const float* const* rows, const float* __restrict w, float bv, float* __restrict yo, int fout) {
+static inline void dwRowT(const float* const* rows, const float* __restrict w, float bv, float* __restrict yo, int fout, const Epi& E) {
     float wv[KT * K]; for (int q = 0; q < KT * K; ++q) wv[q] = w[q];
     int f = 0;
     for (; f + 16 <= fout; f += 16) {
@@ -487,26 +645,26 @@ static inline void dwRowT(const float* const* rows, const float* __restrict w, f
             const float wq = wv[t * K + k]; const float* p = rows[t] + k + f;
             a0 += wq * ld4(p); a1 += wq * ld4(p + 4); a2 += wq * ld4(p + 8); a3 += wq * ld4(p + 12);
         }
-        st4(yo + f, a0); st4(yo + f + 4, a1); st4(yo + f + 8, a2); st4(yo + f + 12, a3);
+        st4(yo + f, epiV(E, a0, f)); st4(yo + f + 4, epiV(E, a1, f + 4)); st4(yo + f + 8, epiV(E, a2, f + 8)); st4(yo + f + 12, epiV(E, a3, f + 12));
     }
     for (; f + 4 <= fout; f += 4) {
         v4f a0 = {bv, bv, bv, bv};
         for (int t = 0; t < KT; ++t) for (int k = 0; k < K; ++k) a0 += wv[t * K + k] * ld4(rows[t] + k + f);
-        st4(yo + f, a0);
+        st4(yo + f, epiV(E, a0, f));
     }
-    for (; f < fout; ++f) { float a = bv; for (int t = 0; t < KT; ++t) for (int k = 0; k < K; ++k) a += wv[t * K + k] * rows[t][k + f]; yo[f] = a; }
+    for (; f < fout; ++f) { float a = bv; for (int t = 0; t < KT; ++t) for (int k = 0; k < K; ++k) a += wv[t * K + k] * rows[t][k + f]; yo[f] = epiS(E, a, f); }
 }
 
 // 若干抽头的连续相关一行：y[f] = b + Σ_q w[q]·p[q][f]（按 q 依次累加）。一次 16 点、4 个累加器。
-static void contigRow(const float* const* p, const float* w, int nt, float bv, float* __restrict y, int n) {
+static void contigRow(const float* const* p, const float* w, int nt, float bv, float* __restrict y, int n, const Epi& E = Epi()) {
     int f = 0;
     for (; f + 16 <= n; f += 16) {
         v4f a0 = {bv, bv, bv, bv}, a1 = a0, a2 = a0, a3 = a0;
         for (int q = 0; q < nt; ++q) { const float wq = w[q]; const float* s = p[q] + f; a0 += wq * ld4(s); a1 += wq * ld4(s + 4); a2 += wq * ld4(s + 8); a3 += wq * ld4(s + 12); }
-        st4(y + f, a0); st4(y + f + 4, a1); st4(y + f + 8, a2); st4(y + f + 12, a3);
+        st4(y + f, epiV(E, a0, f)); st4(y + f + 4, epiV(E, a1, f + 4)); st4(y + f + 8, epiV(E, a2, f + 8)); st4(y + f + 12, epiV(E, a3, f + 12));
     }
-    for (; f + 4 <= n; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < nt; ++q) a0 += w[q] * ld4(p[q] + f); st4(y + f, a0); }
-    for (; f < n; ++f) { float a = bv; for (int q = 0; q < nt; ++q) a += w[q] * p[q][f]; y[f] = a; }
+    for (; f + 4 <= n; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < nt; ++q) a0 += w[q] * ld4(p[q] + f); st4(y + f, epiV(E, a0, f)); }
+    for (; f < n; ++f) { float a = bv; for (int q = 0; q < nt; ++q) a += w[q] * p[q][f]; y[f] = epiS(E, a, f); }
 }
 // 步长 2 的一行：y[f] = b + Σ_q w[q]·p[q][2f]（深度卷积用：每个通道只读自己那一行，拆奇偶的拷贝摊不开，直接交错读）
 static inline v4f ld4s2(const float* p) {
@@ -516,15 +674,15 @@ static inline v4f ld4s2(const float* p) {
     v4f v = {p[0], p[2], p[4], p[6]}; return v;
 #endif
 }
-static void stride2Row(const float* const* p, const float* w, int nt, float bv, float* __restrict y, int n) {
+static void stride2Row(const float* const* p, const float* w, int nt, float bv, float* __restrict y, int n, const Epi& E = Epi()) {
     int f = 0;
     for (; f + 16 <= n; f += 16) {
         v4f a0 = {bv, bv, bv, bv}, a1 = a0, a2 = a0, a3 = a0;
         for (int q = 0; q < nt; ++q) { const float wq = w[q]; const float* s = p[q] + 2 * f; a0 += wq * ld4s2(s); a1 += wq * ld4s2(s + 8); a2 += wq * ld4s2(s + 16); a3 += wq * ld4s2(s + 24); }
-        st4(y + f, a0); st4(y + f + 4, a1); st4(y + f + 8, a2); st4(y + f + 12, a3);
+        st4(y + f, epiV(E, a0, f)); st4(y + f + 4, epiV(E, a1, f + 4)); st4(y + f + 8, epiV(E, a2, f + 8)); st4(y + f + 12, epiV(E, a3, f + 12));
     }
-    for (; f + 4 <= n; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < nt; ++q) a0 += w[q] * ld4s2(p[q] + 2 * f); st4(y + f, a0); }
-    for (; f < n; ++f) { float a = bv; for (int q = 0; q < nt; ++q) a += w[q] * p[q][2 * f]; y[f] = a; }
+    for (; f + 4 <= n; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < nt; ++q) a0 += w[q] * ld4s2(p[q] + 2 * f); st4(y + f, epiV(E, a0, f)); }
+    for (; f < n; ++f) { float a = bv; for (int q = 0; q < nt; ++q) a += w[q] * p[q][2 * f]; y[f] = epiS(E, a, f); }
 }
 
 void Conv::run(const float* x, float* y, const AffinePReLU* post) {
@@ -561,26 +719,26 @@ void Conv::run(const float* x, float* y, const AffinePReLU* post) {
             for (int t = 0; t < kt; ++t) {
                 float* xp = xpb + (size_t)t * PL;
                 const float* xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
-                for (int q = 0; q < L; ++q) xp[q] = 0.0f;
-                memcpy(xp + L, xr, sizeof(float) * fin);
-                for (int q = L + fin; q < PL; ++q) xp[q] = 0.0f;
+                // 10-14：左右补零只在 prepare 里清一次（这块缓冲只有这里写、且只写中间 fin 个）；行很短（几十个数），
+                // 逐行调 libc memcpy / 补零的固定开销占了网络里拷贝 / 清零的大头（采样剖析 32 位合计约 5%），改内联 4 个一组
+                { float* __restrict d = xp + L; int q = 0; for (; q + 4 <= fin; q += 4) st4(d + q, ld4(xr + q)); for (; q < fin; ++q) d[q] = xr[q]; }
                 const float* wr = W + ((size_t)c * kt + (deconv ? kt - 1 - t : t)) * K;
                 for (int k = 0; k < K; ++k) { wv[t * K + k] = deconv ? wr[K - 1 - k] : wr[k]; src[t * K + k] = xp + k; }
             }
             const float* rows[3] = {xpb, kt > 1 ? xpb + PL : xpb, kt > 2 ? xpb + 2 * PL : xpb};
-            if (kt == 1 && K == 5) dwRowT<1, 5>(rows, wv, bv, yo, fout);
-            else if (kt == 2 && K == 3) dwRowT<2, 3>(rows, wv, bv, yo, fout);
+            const Epi E = epiOf(post, c);   // 激活并进收尾（见 Epi）
+            if (kt == 1 && K == 5) dwRowT<1, 5>(rows, wv, bv, yo, fout, E);
+            else if (kt == 2 && K == 3) dwRowT<2, 3>(rows, wv, bv, yo, fout, E);
             else {
                 int f = 0;
                 for (; f < F8; f += 8) {
                     v4f a0 = {bv, bv, bv, bv}, a1 = a0;
                     for (int q = 0; q < NT; ++q) { a0 += wv[q] * ld4(src[q] + f); a1 += wv[q] * ld4(src[q] + f + 4); }
-                    st4(yo + f, a0); st4(yo + f + 4, a1);
+                    st4(yo + f, epiV(E, a0, f)); st4(yo + f + 4, epiV(E, a1, f + 4));
                 }
-                for (; f < F4; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < NT; ++q) a0 += wv[q] * ld4(src[q] + f); st4(yo + f, a0); }
-                for (; f < fout; ++f) { float a = bv; for (int q = 0; q < NT; ++q) a += wv[q] * src[q][f]; yo[f] = a; }
+                for (; f < F4; f += 4) { v4f a0 = {bv, bv, bv, bv}; for (int q = 0; q < NT; ++q) a0 += wv[q] * ld4(src[q] + f); st4(yo + f, epiV(E, a0, f)); }
+                for (; f < fout; ++f) { float a = bv; for (int q = 0; q < NT; ++q) a += wv[q] * src[q][f]; yo[f] = epiS(E, a, f); }
             }
-            if (post) post->row(yo, c);
         }
         if (kt > 1) {
             for (int t = 0; t + 1 < kt - 1; ++t)
@@ -611,14 +769,12 @@ void Conv::run(const float* x, float* y, const AffinePReLU* post) {
                 for (int t = 0; t < kt; ++t) {
                     float* r = pa + (size_t)t * RL;
                     const float* xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
-                    for (int q = 0; q < pf; ++q) r[q] = 0.0f;
-                    memcpy(r + pf, xr, sizeof(float) * fin);
-                    for (int q = pf + fin; q < RL; ++q) r[q] = 0.0f;
+                    // 补零只在 prepare 里清一次（这条路径的每一行只写中间 fin 个；见深度卷积那里）
+                    { float* __restrict d = r + pf; int q = 0; for (; q + 4 <= fin; q += 4) st4(d + q, ld4(xr + q)); for (; q < fin; ++q) d[q] = xr[q]; }
                     const float* wr = W + ((size_t)c * kt + t) * K;
                     for (int k = 0; k < K; ++k) { tapW[nt] = wr[k]; tapP[nt] = r + k; ++nt; }
                 }
-                stride2Row(tapP.data(), tapW.data(), nt, bv, yo, fout);
-                if (post) post->row(yo, c);
+                stride2Row(tapP.data(), tapW.data(), nt, bv, yo, fout, epiOf(post, c));
             }
         } else if (!deconv) {
             // 普通卷积：补零行 xp（左 pf 个零）拆成偶数位 E[m] = xp[2m] 与奇数位 O[m] = xp[2m+1] 两段存，
@@ -645,16 +801,13 @@ void Conv::run(const float* x, float* y, const AffinePReLU* post) {
                     const float* wr = W + ((((size_t)o * cinG + ci) * kt + t) * K);
                     for (int k = 0; k < K; ++k) { tapW[nt] = wr[k]; tapP[nt] = (k & 1 ? E + RH : E) + k / 2; ++nt; }
                 }
-                contigRow(tapP.data(), tapW.data(), nt, bv, yo, fout);
-                if (post) post->row(yo, o);
+                contigRow(tapP.data(), tapW.data(), nt, bv, yo, fout, epiOf(post, o));
             }
         } else {
             for (int c = 0; c < cin; ++c) for (int t = 0; t < kt; ++t) {
                 float* r = pa + ((size_t)c * kt + t) * RL;
                 const float* xr = frameAt(t) + (size_t)(inMap.empty() ? c : inMap[c]) * fin;
-                for (int q = 0; q < padL; ++q) r[q] = 0.0f;
-                memcpy(r + padL, xr, sizeof(float) * fin);
-                for (int q = padL + fin; q < RL; ++q) r[q] = 0.0f;
+                { float* __restrict d = r + padL; int q = 0; for (; q + 4 <= fin; q += 4) st4(d + q, ld4(xr + q)); for (; q < fin; ++q) d[q] = xr[q]; }   // 补零同上，只在 prepare 清一次
             }
             float* __restrict yr = accr.data();                     // 两条奇偶子序列的暂存
             const int M0 = (fout + 1) / 2, M1 = fout / 2;
@@ -846,9 +999,9 @@ void Conv::run(const float* x, float* y, const AffinePReLU* post) {
     if (post) post->run(y);
 }
 
-}  // namespace ulk
+}  // namespace ULK_NS
 
-namespace ulk {
+namespace ULK_NS {
 
 // ---- 组合块 ------------------------------------------------------------
 
@@ -924,16 +1077,25 @@ void DPGRNN::prepare(const Weights& w, const std::string& pfx, int channels, int
     cat.assign((size_t)F * C, 0.0f);
     if (hh > 16 || 3 * hh > 48) throw std::runtime_error("ans48: dpgrnn intra hidden too large");
     pj.assign((size_t)3 * hh * F, 0.0f); gx.assign((size_t)3 * half * F, 0.0f); gh.assign((size_t)3 * half * F, 0.0f);
-    if (hh == 4) {
+    if (hh <= 4) {
+        // 10-14：隐层不足 4（通道 12 → 隐层 3）时补零到 4，走同一条交错路径：补出的隐单元输入投影、偏置、U 全是 0，
+        // 每步 r = z = 0.5、n = tanh(0) = 0，状态恒为 0，对真实单元的累加只加 0·u = 0，结果与不补逐位相同。
         pj4.assign((size_t)4 * 12 * F, 0.0f); uT4.assign(4 * 48, 0.0f); bh4.assign(4 * 12, 0.0f);
         const float* Us[4] = {i1Whh, i1WhhR, i2Whh, i2WhhR}; const float* Bs[4] = {i1bhh, i1bhhR, i2bhh, i2bhhR};
-        for (int k = 0; k < 4; ++k) for (int q = 0; q < 3; ++q) for (int j = 0; j < 4; ++j) {
-            bh4[k * 12 + q * 4 + j] = Bs[k][q * 4 + j];
-            for (int i = 0; i < 4; ++i) uT4[k * 48 + (q * 4 + i) * 4 + j] = Us[k][(q * 4 + j) * 4 + i];
+        const float* Ws[4] = {i1Wih, i1WihR, i2Wih, i2WihR}; const float* Bi[4] = {i1bih, i1bihR, i2bih, i2bihR};
+        for (int k = 0; k < 4; ++k) {
+            wih4[k].assign((size_t)12 * half, 0.0f); bih4[k].assign(12, 0.0f);
+            for (int q = 0; q < 3; ++q) for (int j = 0; j < hh; ++j) {
+                bh4[k * 12 + q * 4 + j] = Bs[k][q * hh + j]; bih4[k][q * 4 + j] = Bi[k][q * hh + j];
+                for (int i = 0; i < hh; ++i) uT4[k * 48 + (q * 4 + i) * 4 + j] = Us[k][(q * hh + j) * hh + i];
+                for (int c = 0; c < half; ++c) wih4[k][(size_t)(q * 4 + j) * half + c] = Ws[k][(size_t)(q * hh + j) * half + c];
+            }
+            pkIntra[k] = packPw(wih4[k].data(), 12, half);
         }
+    } else {
+        pkIntra[0] = packPw(i1Wih, 3 * hh, half); pkIntra[1] = packPw(i1WihR, 3 * hh, half);
+        pkIntra[2] = packPw(i2Wih, 3 * hh, half); pkIntra[3] = packPw(i2WihR, 3 * hh, half);
     }
-    pkIntra[0] = packPw(i1Wih, 3 * hh, half); pkIntra[1] = packPw(i1WihR, 3 * hh, half);
-    pkIntra[2] = packPw(i2Wih, 3 * hh, half); pkIntra[3] = packPw(i2WihR, 3 * hh, half);
     pkIfc = packPw(ifcW, C, C); pkEfc = packPw(efcW, C, C);
     pkEx[0] = packPw(e1Wih, 3 * half, half); pkEx[1] = packPw(e2Wih, 3 * half, half);
     pkEh[0] = packPw(e1Whh, 3 * half, half); pkEh[1] = packPw(e2Whh, 3 * half, half);
@@ -961,7 +1123,7 @@ static inline void intraRec(const float* __restrict U, const float* __restrict b
 // 频率方向递推，隐层 4（10-13）：两组 × 正反两个方向共 4 条递推互不依赖，放进同一个循环交错算（小核顺序执行，
 // 单条递推每步都在等上一步）；一步内 4 个隐单元向量化。各门 = b_hh + 按隐单元下标依次累加 U·h，再与输入投影相加，
 // 式子与 intraRec<4> 相同。P4：4 条各自的输入投影 [3·4][F]；uT：[条][门][i][4]；bh4：[条][门][4]；out[k]：第 k 条的输出行首。
-static void intraRec4x(const float* __restrict uT, const float* __restrict bh4, const float* __restrict P4, int F, float* const* out) {
+static void intraRec4x(const float* __restrict uT, const float* __restrict bh4, const float* __restrict P4, int F, float* const* out, int hh) {
     v4f h[4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
     const size_t PS = (size_t)12 * F;
     for (int s = 0; s < F; ++s) {
@@ -974,10 +1136,10 @@ static void intraRec4x(const float* __restrict uT, const float* __restrict bh4, 
             const v4f pr = {P[(size_t)0 * F + f], P[(size_t)1 * F + f], P[(size_t)2 * F + f], P[(size_t)3 * F + f]};
             const v4f pz = {P[(size_t)4 * F + f], P[(size_t)5 * F + f], P[(size_t)6 * F + f], P[(size_t)7 * F + f]};
             const v4f pn = {P[(size_t)8 * F + f], P[(size_t)9 * F + f], P[(size_t)10 * F + f], P[(size_t)11 * F + f]};
-            const v4f rg = vsigm(pr + g[0]), zg = vsigm(pz + g[1]), ng = vtanh(pn + rg * g[2]);
+            const v4f rg = vsigmF(pr + g[0]), zg = vsigmF(pz + g[1]), ng = vtanhF(pn + rg * g[2]);
             h[k] = (1.0f - zg) * ng + zg * h[k];
             float o[4]; memcpy(o, &h[k], 16); float* ob = out[k];
-            ob[f] = o[0]; ob[(size_t)F + f] = o[1]; ob[(size_t)2 * F + f] = o[2]; ob[(size_t)3 * F + f] = o[3];
+            for (int j = 0; j < hh; ++j) ob[(size_t)j * F + f] = o[j];   // 只写真实的 hh 行（补零的那行不写，否则盖到下一条的输出）
         }
     }
 }
@@ -991,18 +1153,17 @@ void DPGRNN::run(float* x) {
     float* __restrict P = pj.data();                     // [3·hh][F]
     float* __restrict ct = cat.data();                   // [C][F]
     // --- intra：频率方向，双向，两路各吃一半通道 ---
-    if (hh == 4) {
+    if (hh <= 4) {
         float* outs[4];
         for (int r = 0; r < 2; ++r) {
             const float* X = x + (size_t)r * half * F;
             for (int dir = 0; dir < 2; ++dir) {
                 const int k = r * 2 + dir;
-                const float* W = r ? (dir ? i2WihR : i2Wih) : (dir ? i1WihR : i1Wih); const float* bi = r ? (dir ? i2bihR : i2bih) : (dir ? i1bihR : i1bih);
-                { OPT(kOpDpPw); pw(W, bi, X, pj4.data() + (size_t)k * 12 * F, 12, half, F, nullptr, 0, pkIntra[k].data()); }
+                { OPT(kOpDpPw); pw(wih4[k].data(), bih4[k].data(), X, pj4.data() + (size_t)k * 12 * F, 12, half, F, nullptr, 0, pkIntra[k].data()); }
                 outs[k] = ct + (size_t)(r * 2 * hh + dir * hh) * F;
             }
         }
-        { OPT(kOpDpRec); intraRec4x(uT4.data(), bh4.data(), pj4.data(), F, outs); }
+        { OPT(kOpDpRec); intraRec4x(uT4.data(), bh4.data(), pj4.data(), F, outs, hh); }
     } else
     for (int r = 0; r < 2; ++r) {
         const float* X = x + (size_t)r * half * F;
@@ -1030,7 +1191,9 @@ void DPGRNN::run(float* x) {
             const float *xr = Gx + (size_t)i * F, *xz = Gx + (size_t)(half + i) * F, *xn = Gx + (size_t)(2 * half + i) * F;
             const float *hr = Gh + (size_t)i * F, *hz = Gh + (size_t)(half + i) * F, *hn = Gh + (size_t)(2 * half + i) * F;
             float* hs = Hs + (size_t)i * F;
-            for (int f = 0; f < F; ++f) { const float rg = fsigm(xr[f] + hr[f]), zg = fsigm(xz[f] + hz[f]), ng = ftanh(xn[f] + rg * hn[f]); hs[f] = (1.0f - zg) * ng + zg * hs[f]; }
+            int f = 0;   // 10-14：4 个频点一组向量化（式子同下面的标量尾巴）
+            for (; f + 4 <= F; f += 4) { const v4f rg = vsigm(ld4(xr + f) + ld4(hr + f)), zg = vsigm(ld4(xz + f) + ld4(hz + f)), ng = vtanh(ld4(xn + f) + rg * ld4(hn + f)); st4(hs + f, (1.0f - zg) * ng + zg * ld4(hs + f)); }
+            for (; f < F; ++f) { const float rg = fsigm(xr[f] + hr[f]), zg = fsigm(xz[f] + hz[f]), ng = ftanh(xn[f] + rg * hn[f]); hs[f] = (1.0f - zg) * ng + zg * hs[f]; }
         }
     }
     { OPT(kOpDpPw); pw(efcW, efcB, hInter.data(), xfc.data(), C, C, F, nullptr, 0, pkEfc.data()); }
@@ -1038,9 +1201,9 @@ void DPGRNN::run(float* x) {
     for (size_t i = 0; i < (size_t)F * C; ++i) x[i] += xfc[i];
 }
 
-}  // namespace ulk
+}  // namespace ULK_NS
 
-namespace ulk {
+namespace ULK_NS {
 
 // ---- 网络装配 ----------------------------------------------------------
 //
@@ -1147,18 +1310,25 @@ bool Net::prepare() {
     // 窗 256 / 128 两者恰好相等（129 / 65），窗 1024 不相等（513 ≠ 129）。
     const int F0 = WF;
 
-    mkXConv(&en0, w, "encoder.en_convs.0", 1, 12, W0, 3, 3, 2, 1, F0, false, false);
-    mkXMB (&en1, w, "encoder.en_convs.1", 12, 24, W1, 2, 3, 2, 2, en0.fout, false, false);
-    mkXDWS(&en2, w, "encoder.en_convs.2", 24, 24, W2, 2, 3, 1, 2, en1.fout, false);
-    mkXMB (&en3, w, "encoder.en_convs.3", 24, 32, W3, 1, 5, 1, 2, en2.fout, false, false);
-    mkXDWS(&en4, w, "encoder.en_convs.4", 32, 16, W4, 1, 5, 1, 2, en3.fout, false);
-    dp0.prepare(w, "dpgrnn.0", 16, W4);
-    dp1.prepare(w, "dpgrnn.1", 16, W4);
-    mkXDWS(&de0, w, "decoder.de_convs.0", 16, 32, W3, 1, 5, 1, 2, en4.fout, true);
-    mkXMB (&de1, w, "decoder.de_convs.1", 32, 24, W2, 1, 5, 1, 2, de0.fout, true, false);
-    mkXDWS(&de2, w, "decoder.de_convs.2", 24, 24, W1, 2, 3, 1, 2, de1.fout, true);
-    mkXMB (&de3, w, "decoder.de_convs.3", 24, 12, W0, 2, 3, 2, 2, de2.fout, true, false);
-    mkXConv(&de4, w, "decoder.de_convs.4", 12, 1, WF, 3, 3, 2, 1, de3.fout, true, true);
+    // 五级通道数也从权重形状读（10-14：小核目标要试缩通道的模型；原写死 12/24/24/32/16）
+    auto outCh = [&](const char* n) { return w.at(n).shape[0]; };
+    const int C0 = outCh("encoder.en_convs.0.ops.1.weight"), C1 = outCh("encoder.en_convs.1.pconv1.0.weight"),
+              C2 = outCh("encoder.en_convs.2.pconv.0.weight"), C3 = outCh("encoder.en_convs.3.pconv1.0.weight"),
+              C4 = outCh("encoder.en_convs.4.pconv.0.weight");
+    if (C0 % 2 || C1 % 2 || C2 % 2 || C3 % 2 || C4 % 4) throw std::runtime_error("ans48: channel counts must be even (C4 multiple of 4)");
+
+    mkXConv(&en0, w, "encoder.en_convs.0", 1, C0, W0, 3, 3, 2, 1, F0, false, false);
+    mkXMB (&en1, w, "encoder.en_convs.1", C0, C1, W1, 2, 3, 2, 2, en0.fout, false, false);
+    mkXDWS(&en2, w, "encoder.en_convs.2", C1, C2, W2, 2, 3, 1, 2, en1.fout, false);
+    mkXMB (&en3, w, "encoder.en_convs.3", C2, C3, W3, 1, 5, 1, 2, en2.fout, false, false);
+    mkXDWS(&en4, w, "encoder.en_convs.4", C3, C4, W4, 1, 5, 1, 2, en3.fout, false);
+    dp0.prepare(w, "dpgrnn.0", C4, W4);
+    dp1.prepare(w, "dpgrnn.1", C4, W4);
+    mkXDWS(&de0, w, "decoder.de_convs.0", C4, C3, W3, 1, 5, 1, 2, en4.fout, true);
+    mkXMB (&de1, w, "decoder.de_convs.1", C3, C2, W2, 1, 5, 1, 2, de0.fout, true, false);
+    mkXDWS(&de2, w, "decoder.de_convs.2", C2, C1, W1, 2, 3, 1, 2, de1.fout, true);
+    mkXMB (&de3, w, "decoder.de_convs.3", C1, C0, W0, 2, 3, 2, 2, de2.fout, true, false);
+    mkXConv(&de4, w, "decoder.de_convs.4", C0, 1, WF, 3, 3, 2, 1, de3.fout, true, true);
 
     feat.assign(F0, 0.0f);
     e0.assign((size_t)en0.cout * en0.fout, 0.0f);
@@ -1260,4 +1430,22 @@ void Net::run(const float* logmag, float* mask) {
     if (profiling) prof.calls++;
 }
 
-}  // namespace ulk
+}  // namespace ULK_NS
+
+// ---- 对外接口的实现（每份内核各一个；newNet() 在 net_select.cpp 里按 CPU 能力选）----
+#include "net_iface.h"
+namespace ULK_NS {
+namespace {
+struct NetImpl final : ulk_if::INet {
+    Net n;
+    bool load(const void* bin, size_t bytes, const char* json) override { return n.w.loadFromMemory(bin, bytes, json); }
+    bool prepare() override {
+        if (!n.prepare()) return false;
+        nFft = n.w.nFft; hop = n.w.hop; fs = n.w.fs; bins = n.bins; return true;
+    }
+    void reset() override { n.reset(); }
+    void run(const float* logmag, float* mask) override { n.run(logmag, mask); }
+};
+}  // namespace
+ulk_if::INet* newNetImpl() { return new NetImpl(); }
+}  // namespace ULK_NS

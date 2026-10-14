@@ -16,10 +16,13 @@
 #include <thread>
 static std::vector<short> rd(const char* p) { FILE* f = fopen(p, "rb"); if (!f) { perror(p); exit(2); } fseek(f, 0, SEEK_END); long n = ftell(f) / 2; fseek(f, 0, SEEK_SET); std::vector<short> v(n); if (fread(v.data(), 2, n, f) != (size_t)n) exit(2); fclose(f); return v; }
 static long rss_kb() { FILE* f = fopen("/proc/self/status", "r"); char l[256]; long v = -1; while (f && fgets(l, sizeof l, f)) if (!strncmp(l, "VmRSS:", 6)) v = atol(l + 6); if (f) fclose(f); return v; }
+// 每帧本线程 CPU 时间的统计：不含被别的任务抢占的时间（墙钟超时里那部分取决于接入方音频线程的优先级，不是计算量）
+struct CpuStat { double p99, mx; int over; };
+static CpuStat cpuStat(std::vector<double> v, double per) { int o = 0; for (double d : v) if (d > per) ++o; std::sort(v.begin(), v.end()); return { v[(size_t)(0.99 * (v.size() - 1))], v.back(), o }; }
 static double tcpu() { timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 int main(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "用法：%s in.pcm 采样率 monitor|stream 秒数 [paced=1] [块长] [强度]\n", argv[0]); return 2; }
-    auto in = rd(argv[1]); int sr = atoi(argv[2]); const bool mon = !strcmp(argv[3], "monitor"); double secs = atof(argv[4]); bool paced = argc < 6 || atoi(argv[5]) != 0;
+    auto in = rd(argv[1]); int sr = atoi(argv[2]); const bool mon = !strcmp(argv[3], "monitor"); double secs = atof(argv[4]); int paced = argc < 6 ? 1 : atoi(argv[5]);
     if (!strcmp(argv[3], "spec")) {   // 频谱档：每帧一次 ans48_spec_frame
         const int N = 1536, H = 384, BN = N / 2 + 1; long T = (long)in.size() / H - 1;
         std::vector<float> w(N); for (int i = 0; i < N; ++i) w[i] = sqrtf(0.5f * (1.f - cosf(2.f * (float)M_PI * i / N)));
@@ -32,19 +35,19 @@ int main(int argc, char** argv) {
         pffft_aligned_free(fi); pffft_aligned_free(fo); pffft_aligned_free(wk); pffft_destroy_setup(fs_);
         long r0 = rss_kb(); Ans48* a = ans48_create_spec(sr, N, H, ANS48_WINDOW_SQRT_HANN_PERIODIC); if (!a) { fprintf(stderr, "ans48_create_spec 失败\n"); return 1; } long r1 = rss_kb();
         if (argc > 7) ans48_set_strength(a, (float)atof(argv[7]));
-        long nb = (long)(secs * sr / H); std::vector<double> t(nb); int over = 0; const double per = 1000.0 * H / sr;
+        long nb = (long)(secs * sr / H); std::vector<double> t(nb), tc(nb); int over = 0; const double per = 1000.0 * H / sr;
         std::vector<float> re(BN), im(BN);
         auto w0 = std::chrono::steady_clock::now(); double c0 = tcpu(); auto next = w0;
         for (long k = 0; k < nb; ++k) {
-            if (paced) { std::this_thread::sleep_until(next); next += std::chrono::nanoseconds((long long)(1e9 * H / sr)); }
+            if (paced) { if (paced == 2) { while (std::chrono::steady_clock::now() < next) {} } else std::this_thread::sleep_until(next); next += std::chrono::nanoseconds((long long)(1e9 * H / sr)); }
             const long c = k % T; memcpy(re.data(), &RE[(size_t)c * BN], BN * 4); memcpy(im.data(), &IM[(size_t)c * BN], BN * 4);
-            auto s0 = std::chrono::steady_clock::now(); ans48_spec_frame(a, re.data(), im.data(), BN);
-            t[k] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count(); if (t[k] > per) ++over;
+            const double q0 = tcpu(); auto s0 = std::chrono::steady_clock::now(); ans48_spec_frame(a, re.data(), im.data(), BN);
+            t[k] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count(); tc[k] = 1000.0 * (tcpu() - q0); if (t[k] > per) ++over;
         }
         double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), cpu = tcpu() - c0; long r2 = rss_kb();
-        std::vector<double> s = t; std::sort(s.begin(), s.end()); double mean = 0; for (double v : t) mean += v; mean /= nb;
-        printf("{\"mode\":\"spec\",\"sr\":%d,\"block\":%d,\"gamma\":%.2f,\"paced\":%d,\"sec\":%.1f,\"blocks\":%ld,\"cpu_pct\":%.2f,\"rtf\":%.4f,\"mean_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f,\"over\":%d,\"rss_create_kb\":%ld,\"rss_run_kb\":%ld}\n",
-               sr, H, ans48_get_strength(a), paced, wall, nb, 100.0 * cpu / wall, mean / per, mean, s[(size_t)(0.99 * (nb - 1))], s.back(), over, r1 - r0, r2 - r0);
+        std::vector<double> s = t; std::sort(s.begin(), s.end()); double mean = 0; for (double v : t) mean += v; mean /= nb; const CpuStat CS = cpuStat(tc, per);
+        printf("{\"mode\":\"spec\",\"sr\":%d,\"block\":%d,\"gamma\":%.2f,\"paced\":%d,\"sec\":%.1f,\"blocks\":%ld,\"cpu_pct\":%.2f,\"rtf\":%.4f,\"mean_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f,\"over\":%d,\"cpu_p99_ms\":%.3f,\"cpu_max_ms\":%.3f,\"cpu_over\":%d,\"rss_create_kb\":%ld,\"rss_run_kb\":%ld}\n",
+               sr, H, ans48_get_strength(a), paced, wall, nb, 100.0 * cpu / wall, mean / per, mean, s[(size_t)(0.99 * (nb - 1))], s.back(), over, CS.p99, CS.mx, CS.over, r1 - r0, r2 - r0);
         ans48_destroy(a); return 0;
     }
     const int B = argc > 6 && atoi(argv[6]) > 0 ? atoi(argv[6]) : (mon ? 128 : 512);
@@ -52,17 +55,23 @@ int main(int argc, char** argv) {
     std::vector<float> x(nIn), o(B); for (long i = 0; i < nIn; ++i) x[i] = in[i] / 32768.f;
     long r0 = rss_kb(); Ans48* a = ans48_create(sr, mon ? ANS48_MODE_MONITOR : ANS48_MODE_STREAM); if (!a) { fprintf(stderr, "ans48_create 失败\n"); return 1; } long r1 = rss_kb();
     if (argc > 7) ans48_set_strength(a, (float)atof(argv[7]));
-    std::vector<double> t(nb); int over = 0; const double per = 1000.0 * B / sr;
+    std::vector<double> t(nb), tc(nb); int over = 0; const double per = 1000.0 * B / sr;
+    const int evictMb = getenv("ANS48_EVICT_MB") ? atoi(getenv("ANS48_EVICT_MB")) : 0; std::vector<int> ev((size_t)evictMb * 262144, 0);
+    Ans48* warm = paced == 3 ? ans48_create(sr, mon ? ANS48_MODE_MONITOR : ANS48_MODE_STREAM) : nullptr; std::vector<float> ow(B);
     auto w0 = std::chrono::steady_clock::now(); double c0 = tcpu(); auto next = w0;
     for (long k = 0; k < nb; ++k) {
-        if (paced) { std::this_thread::sleep_until(next); next += std::chrono::nanoseconds((long long)(1e9 * B / sr)); }
-        long off = (k * B) % nIn; auto s = std::chrono::steady_clock::now();
+        if (paced) { if (paced == 2) { while (std::chrono::steady_clock::now() < next) {} } else std::this_thread::sleep_until(next); next += std::chrono::nanoseconds((long long)(1e9 * B / sr)); }   // paced=2：空转等待；paced=3：睡眠等待，计时前先让另一实例跑一帧（诊断用）
+        long off = (k * B) % nIn;
+        if (paced == 3) ans48_process(warm, &x[off], ow.data(), B);   // 诊断：先让另一个实例跑一帧（代码与分支预测热起来，本实例的权重仍是冷的），不计时
+        if (paced == 4) ans48_process(a, &x[off], ow.data(), B);      // 诊断：同一实例先跑一帧不计时（本实例权重与状态都热起来；状态推进两次，输出不作数）
+        if (evictMb) { for (size_t q = 0; q < ev.size(); q += 16) ev[q] += 1; }   // 每块前把缓存冲掉（验证「按节奏时缓存被清空」的假设用）
+        const double q0 = tcpu(); auto s = std::chrono::steady_clock::now();
         ans48_process(a, &x[off], o.data(), B);
-        t[k] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count(); if (t[k] > per) ++over;
+        t[k] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count(); tc[k] = 1000.0 * (tcpu() - q0); if (t[k] > per) ++over;
     }
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), cpu = tcpu() - c0; long r2 = rss_kb();
-    std::vector<double> s = t; std::sort(s.begin(), s.end()); double mean = 0; for (double v : t) mean += v; mean /= nb;
-    printf("{\"mode\":\"%s\",\"sr\":%d,\"block\":%d,\"gamma\":%.2f,\"paced\":%d,\"sec\":%.1f,\"blocks\":%ld,\"cpu_pct\":%.2f,\"rtf\":%.4f,\"mean_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f,\"over\":%d,\"rss_create_kb\":%ld,\"rss_run_kb\":%ld}\n",
-           mon ? "monitor" : "stream", sr, B, ans48_get_strength(a), paced, wall, nb, 100.0 * cpu / wall, mean / per, mean, s[(size_t)(0.99 * (nb - 1))], s.back(), over, r1 - r0, r2 - r0);
+    std::vector<double> s = t; std::sort(s.begin(), s.end()); double mean = 0; for (double v : t) mean += v; mean /= nb; const CpuStat CS = cpuStat(tc, per);
+    printf("{\"mode\":\"%s\",\"sr\":%d,\"block\":%d,\"gamma\":%.2f,\"paced\":%d,\"sec\":%.1f,\"blocks\":%ld,\"cpu_pct\":%.2f,\"rtf\":%.4f,\"mean_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f,\"over\":%d,\"cpu_p99_ms\":%.3f,\"cpu_max_ms\":%.3f,\"cpu_over\":%d,\"rss_create_kb\":%ld,\"rss_run_kb\":%ld}\n",
+           mon ? "monitor" : "stream", sr, B, ans48_get_strength(a), paced, wall, nb, 100.0 * cpu / wall, mean / per, mean, s[(size_t)(0.99 * (nb - 1))], s.back(), over, CS.p99, CS.mx, CS.over, r1 - r0, r2 - r0);
     ans48_destroy(a); return 0;
 }
